@@ -42,6 +42,8 @@
 | 计划整体超时 | **2 小时** hard timeout（可配置） |
 | 单 item 超时 | 接口 = **90s**（沿用现有）<br>场景 = **步数 × 90s** （以场景包含的接口数动态计算） |
 | AI Cron 服务 | **抽到 `test-mng-common`**（公共模块），UI/API 测试计划共用 |
+| 定时任务存储 | **复用** `tb_scenario_schedule_task` 表，加 `task_type` 字段区分 `SCENARIO` / `TEST_PLAN`；`tb_api_test_plan` **不**内嵌 cron 字段 |
+| 定时任务列表入口 | 「测试报告」tab 后已有的「定时任务」tab，统一展示两类，加「类型」列 |
 
 ---
 
@@ -95,8 +97,11 @@ const navTabs = [
 | 路径 | 作用 |
 |---|---|
 | `src/views/case/detail/components/scene/ApiTestPlan.vue` | 接口测试计划主组件（参考 `UiTestPlan.vue` 直接复制裁剪） |
-| `src/api/interface/apiTestPlan.ts` | 类型定义命名空间 `ApiTestPlan` |
-| `src/api/modules/apiTestPlan.ts` | API 调用封装 |
+| `src/views/case/detail/components/scene/ApiTestPlanScheduleTaskDialog.vue` | 测试计划定时任务弹窗（去掉环境字段；**只在「定时任务」tab 行编辑时使用**——计划详情面板用内联 section，不调本弹窗） |
+| `src/api/interface/apiTestPlan.ts` | 类型定义命名空间 `ApiTestPlan`；**注意**：`PlanItem` / `UpdateBody` 中的 `cronEnabled` / `cronExpression` 字段需要**移除**（cron 已迁到 schedule_task） |
+| `src/api/interface/apiTestPlanScheduleTask.ts` | 测试计划定时任务类型定义 |
+| `src/api/modules/apiTestPlan.ts` | 计划 CRUD/条目/执行 API 调用封装 |
+| `src/api/modules/apiTestPlanScheduleTask.ts` | 测试计划定时任务 CRUD 调用封装 |
 | `src/stores/modules/apiTestPlanExecution.ts` | 执行状态 Store（与 `testPlanExecution.ts` 结构一致） |
 
 > 「负责人下拉框」（带头像 + 企业名 tag）已抽成全局组件 `src/components/MemberSelect/index.vue`，UI/接口测试计划共用，**不属于本模块新增**。新建/编辑计划弹窗里直接写：
@@ -121,8 +126,9 @@ const navTabs = [
 │ 左侧计划列表   │ 右侧详情                                    │
 │                │ ┌─ 标题栏：计划名 / 执行·编辑·复制·删除 ─┐│
 │ ┌搜索框─────┐  │ ├─ 基本信息（描述、负责人、时间）─────────┤│
-│ │ 计划名 A   │  │ ├─ 定时执行（Cron + AI 生成 + 下 5 次）──┤│
-│ │ 计划名 B ◀ │  │ ├─ 执行模式（● 串行  ○ 并行 最大 5）─────┤│
+│ │ 计划名 A   │  │ ├─ 执行模式（● 串行  ○ 并行 最大 5）─────┤│
+│ │ 计划名 B ◀ │  │ ├─ 定时执行（switch + cron 输入 + AI 生成）─┤│
+│ │ …         │  │ │   ↑ 与 UI 测试计划同构（cronstrue 中文预览 + 下5次）│
 │ │ …         │  │ ├─ 条目列表（单接口 + 场景，拖拽）──────┤│
 │ └───────────┘  │ │   [批量设置环境] [批量移除] [导入条目]│
 │ （右键菜单：   │ │   ┌─┬─┬──────┬─────┬──────┬─────┬──┐│
@@ -201,6 +207,72 @@ interface ApiPlanExecutionState {
 // Map<planId, state>
 ```
 
+### 3.6 「定时任务」tab 的统一改造
+
+#### 3.6.1 现状
+- 现有「定时任务」tab 在 `SceneIndex.vue` 已存在，宿主组件是 `SceneScheduleTask.vue`
+- 当前只调 `getScenarioScheduleTaskListApi`，列表只展示场景定时
+
+#### 3.6.2 改造点
+- `SceneScheduleTask.vue`（**保留文件名**避免大改）调用的接口不变（`/scenario-schedule-task/list`），但**不再传 `taskType`**，由后端返回所有类型
+- 表格新增「类型」列（紧跟"任务名称"右侧）：
+  ```vue
+  <el-table-column label="类型" width="100">
+    <template #default="{ row }">
+      <el-tag :type="row.taskType === 'TEST_PLAN' ? 'warning' : 'info'">
+        {{ row.taskType === 'TEST_PLAN' ? '测试计划' : '场景' }}
+      </el-tag>
+    </template>
+  </el-table-column>
+  ```
+- 操作列分支：
+  | 操作 | SCENARIO | TEST_PLAN |
+  |---|---|---|
+  | 详情 | 现有 `ScheduleTaskDialog`（场景版） | 新增 `ApiTestPlanScheduleTaskDialog`（去掉环境字段，把场景选择器换成计划选择器） |
+  | 立即执行 | 现有接口 | 同接口（后端已分发） |
+  | 启停切换 | 现有接口 | 同接口 |
+  | 删除 | 现有接口 | 同接口（语义=删除该定时任务记录，**不影响计划本身**） |
+
+#### 3.6.3 计划页面的定时任务入口（**对齐 UI 测试计划：内联 cron 配置**）
+
+**关键决策**：与 `UiTestPlan.vue` UI/交互保持完全一致——**内联**定时配置 section（不是弹窗按钮），每个 plan 走 1:1 模型。
+
+```
+┌─ 定时执行 ─────────────────────────────────────────────┐
+│ [● 启用定时执行]                                       │
+│ ┌─────────────┐ [保存] 或 [描述输入框] [AI 生成 ⓘ]   │
+│ │ 0 9 * * *   │                                        │
+│ └─────────────┘                                        │
+│ 执行规则：每天上午 9:00（cronstrue 中文）             │
+│ 接下来 5 次执行时间： [...] [...] [...]                │
+│ 常用示例（点击填写）： [每天9:00] [工作日9:00] ...    │
+│ ⓘ 格式：分钟 小时 日 月 星期                           │
+└────────────────────────────────────────────────────────┘
+```
+
+**实现要点**（`ApiTestPlan.vue`）：
+- 切换 plan 时调 `listApiTestPlanScheduleTasksByPlanApi(planId, current=1, size=1)`，取首条作 `currentScheduleTask` 填表单
+- **启停切换**：
+  - 开启：若 `currentScheduleTask` 存在 → `toggleScenarioScheduleTaskStatusApi(id, true)`；否则 → `createApiTestPlanScheduleTaskApi(...)`（默认 cron `0 9 * * *`）
+  - 关闭：`toggleScenarioScheduleTaskStatusApi(id, false)`，**保留任务记录**（用户再次启用时复用）
+- **保存**：有记录则 update，无则 create；不主动改启停
+- **AI 生成**：`generateCronByAiApi(enterpriseId, description)`（直接复用 `@/api/modules/uiTestPlan` 中已有的 endpoint，跨模块通用）
+- **下 5 次执行时间**：前端用 `cron-parser` 计算；**表达式中文描述**：用 `cronstrue/i18n` 渲染
+
+**1:1 vs 多对一权衡**：表层支持一个 plan 多条 schedule task，但**计划详情面板内联只展示 / 编辑最新一条**。如果用户通过其他途径（API、未来扩展）创建多条，只能在「定时任务」tab 看到全部、用 `ApiTestPlanScheduleTaskDialog` 编辑。这保持了 UI 与 UiTestPlan 一致的简化心智模型。
+
+#### 3.6.4 新增 / 修改文件清单
+
+| 路径 | 改动 |
+|---|---|
+| `src/api/interface/scene-schedule-task.ts` | VO/DTO 加 `taskType?: "SCENARIO" \| "TEST_PLAN"` 字段；list DTO 加可选 `taskType` 过滤 |
+| `src/api/interface/apiTestPlanScheduleTask.ts` | **新增** TS 命名空间 |
+| `src/api/modules/apiTestPlanScheduleTask.ts` | **新增** create/update/detail/list-by-plan 调用封装 |
+| `src/views/case/detail/components/scene/SceneScheduleTask.vue` | 加类型列；操作列根据 taskType 分支打开不同弹窗 |
+| `src/views/case/detail/components/scene/ScheduleTaskDialog.vue` | list 调用加 `taskType: "SCENARIO"` 过滤（防共表跨类型 ID 误匹配） |
+| `src/views/case/detail/components/scene/ApiTestPlanScheduleTaskDialog.vue` | **新增**（仅供「定时任务」tab 行编辑使用，不在计划详情面板使用） |
+| `src/views/case/detail/components/scene/ApiTestPlan.vue` | 内联 cron section（switch / cron 输入 / AI 生成 / 示例 / 预览 / 下 5 次），与 UiTestPlan.vue 1:1 一致 |
+
 ---
 
 ## 4. 后端设计
@@ -247,10 +319,9 @@ interface ApiPlanExecutionState {
 |---|---|
 | `GET /api-test/v1/test-plans?enterpriseId&caseLibraryId&keyword&page&size` | 列表（支持关键字搜索） |
 | `POST /api-test/v1/test-plans` | 新建 |
-| `POST /api-test/v1/test-plans/{planId}` | 更新（含 executionMode、cronEnabled、cronExpression 等） |
+| `POST /api-test/v1/test-plans/{planId}` | 更新（含 executionMode、parallelLimit、maintainerId 等；**不含 cron**，cron 由 §4.2.4 管理） |
 | `DELETE /api-test/v1/test-plans/{planId}` | 删除 |
-| `POST /api-test/v1/test-plans/{planId}/copy` | 复制（含所有 item，不含执行历史） |
-| `POST /api-test/v1/test-plans/generate-cron` | AI 生成 cron（复用已有 AI 服务） |
+| `POST /api-test/v1/test-plans/{planId}/copy` | 复制（含所有 item，不含执行历史与定时任务） |
 
 #### 4.2.2 条目管理（`test-mng-api-test`）
 | Method + Path | 说明 |
@@ -263,7 +334,29 @@ interface ApiPlanExecutionState {
 | `POST /api-test/v1/test-plans/{planId}/items/{itemId}/environment` | 单条设置环境 |
 | `POST /api-test/v1/test-plans/{planId}/items/batch-env` | 批量设置环境（body: `{itemIds, environmentId \| null}`） |
 
-#### 4.2.3 执行控制（`test-mng-api-test-execution`）
+#### 4.2.3 定时任务（`test-mng-api-test-execution`，与场景定时同服务）
+新增一组只属于"测试计划"的定时 CRUD（底层共用 `tb_scenario_schedule_task` 表，写入时 `task_type='TEST_PLAN'`）：
+
+| Method + Path | 说明 |
+|---|---|
+| `POST /api-test-plan-schedule-task/create` | 新建测试计划定时任务（body: `{spaceId, planId, taskName, cronExpression}`） |
+| `POST /api-test-plan-schedule-task/update` | 更新（body: `{id, taskName?, planId?, cronExpression?}`） |
+| `POST /api-test-plan-schedule-task/detail` | 详情 |
+| `POST /api-test-plan-schedule-task/list` | 按 plan 列出该计划下所有定时（`{spaceId, planId, current, size}`） |
+
+**复用**现有场景定时接口（已可在统一 `task_type` 维度操作，新加 `taskType` 入参兼容旧调用）：
+
+| Method + Path | 说明 |
+|---|---|
+| `POST /scenario-schedule-task/list` | **改造** 新增可选 `taskType` 入参（不传=全部，传`SCENARIO`/`TEST_PLAN`过滤）；VO 增加 `taskType` 字段 |
+| `POST /scenario-schedule-task/toggle` | 启停（**完全复用**，操作语义一致） |
+| `POST /scenario-schedule-task/execute-now` | 立即执行（**完全复用**，内部 `ScheduleTaskExecutor.doExecute` 已加 `task_type` 分支） |
+| `POST /scenario-schedule-task/delete` | 删除定时（**完全复用**） |
+| `POST /scenario-schedule-task/generate-cron` | AI 生成 cron（复用已有 AI 服务，UI/场景/测试计划共用） |
+
+> 「定时任务」tab 的统一列表接口直接用 `POST /scenario-schedule-task/list`（不传 taskType），不另起 `unified-list` 接口。
+
+#### 4.2.4 执行控制（`test-mng-api-test-execution`）
 | Method + Path | 说明 |
 |---|---|
 | `POST /api-test-execution/v1/test-plans/{planId}/run` | 触发执行，返回 `executionId` |
@@ -419,14 +512,66 @@ void executeItem(PlanItem item, String execId) {
 服务端实现用 Spring WebSocket（`@Controller` + `TextWebSocketHandler`），维护 `Map<executionId, Set<WebSocketSession>>`，broadcast 时遍历推送。心跳：服务端每 25s 发 `heartbeat`，客户端回相同消息保活。
 
 ### 4.6 定时调度
-复用 UI 测试计划同款机制：
-- `cron_enabled + cron_expression` 字段存在 plan 表
-- Spring `ThreadPoolTaskScheduler`（已有 `ScheduleExecutorConfig`）+ `@PostConstruct` 扫表注册 `ScheduledFuture`
-- plan 更新 cron 时重新 reschedule
-- 服务启动时加载所有 `cron_enabled=1` 的 plan 注册
-- 到点触发走和手动相同的 `PlanRunner.run(...)` 路径，executor 注为 system
 
-AI 生成 Cron：**抽到 `test-mng-common` 公共模块**，UI 测试计划与 API 测试计划共用。
+**关键决策：复用现有 `tb_scenario_schedule_task` 表 + 加 `task_type` 区分**，不在 `tb_api_test_plan` 内嵌 cron 字段。理由：
+1. 表整套代码已经在 `test-mng-api-test-execution`（与 PlanRunner 同服务，本地方法调用，无需 Feign）
+2. `ScenarioScheduleScheduler` + `ScheduleTaskExecutor` + Redisson 分布式锁机制已经成熟，加一个 type 分支即可
+3. 字段 `last_execute_time` / `next_execute_time` / `last_execute_status` / `last_execution_id` 表里都有，不需要给 plan 表加冗余
+4. 表层支持 1:N（一个 plan 多条定时），但**前端 UI 维持 1:1**（与 UiTestPlan 一致），见 §3.6.3
+
+#### 4.6.1 表扩展（详见 §5.5）
+```sql
+ALTER TABLE tb_scenario_schedule_task
+  ADD COLUMN task_type VARCHAR(16) NOT NULL DEFAULT 'SCENARIO'
+       COMMENT '任务类型: SCENARIO=场景定时, TEST_PLAN=测试计划定时' AFTER id,
+  ADD KEY idx_task_type_space (task_type, space_id);
+```
+
+字段语义复用：
+- `scenario_id` → `SCENARIO` 时存场景 id；`TEST_PLAN` 时**存计划 id**（字段名误导，但不改名以避免大面积影响）
+- `scenario_name` → 场景名 / 计划名快照
+- `environment_id` → `SCENARIO` 时存环境；`TEST_PLAN` 时为 NULL（环境在 item 级覆盖，plan 级没有）
+- 其余字段（cron_expression / task_status / last_execute_* / next_execute_* / create_user_* / time）完全通用
+
+#### 4.6.2 调度器扩展
+- `ScenarioScheduleScheduler.init()` 启动加载逻辑不变（按 `task_status=1 AND deleted=0` 扫全表，包含两类）
+- `addTask` / `removeTask` 不变（操作泛型 task）
+- **`ScheduleTaskExecutor.doExecute(taskId)` 加 type 分支**：
+  ```java
+  switch (task.getTaskType()) {
+      case "SCENARIO" -> {
+          ScenarioExecutionCreateDTO dto = ...;
+          executionId = scenarioExecutionService.create(dto, userId, enterpriseId);
+      }
+      case "TEST_PLAN" -> {
+          // 跑测试计划：scenarioId 字段实际存的是 planId
+          executionId = planRunner.run(task.getScenarioId(), userId, enterpriseId, "SCHEDULED");
+      }
+  }
+  ```
+- 分布式锁、last/next 字段回写、错误处理逻辑完全复用
+
+#### 4.6.3 CRUD API
+- **toggle / delete / executeNow**：完全复用现有 scenario 接口（操作语义无差异，两类型都允许）。`executeNow` 内部已经走 `ScheduleTaskExecutor`，type 分支已支持。
+- **list 接口改造**：现有 `/scenario-schedule-task/list` 加可选入参 `taskType`（不传 = 全部），VO 新增 `taskType` 字段返回。
+- **create / update 拆开新增**：因入参差异（场景需 `environmentId` + `scenarioId`，测试计划需 `planId`，没有环境），新增 `ApiTestPlanScheduleTaskController` 提供 create / update / detail / list-by-plan 接口，**底层共用** `ScenarioScheduleTaskMapper`，写入时 `set task_type='TEST_PLAN'`。
+
+#### 4.6.3.1 共表防误操作（重要）
+两类 service 的 `update` / `getDetail` 在 load 实体时**必须校验 `task_type`**，否则跨类型 ID 会静默写脏数据：
+
+```java
+// ApiTestPlanScheduleTaskServiceImpl.loadTaskOrThrow
+if (!TASK_TYPE.equals(entity.getTaskType())) {
+    throw new BizException(BizCodeEnum.SCHEDULE_TASK_NOT_EXIST);
+}
+```
+对称地，`ScenarioScheduleTaskServiceImpl.loadScenarioTaskOrThrow` 拒绝 `taskType` 非 `SCENARIO` 的行（兼容历史 `taskType=null` 视为 SCENARIO）。
+`delete` / `toggleStatus` 故意保留不分类型（两种类型在「定时任务」tab 行级操作上需要统一接口）。
+
+前端 `ScheduleTaskDialog.vue` 的 list 调用也必须传 `taskType: "SCENARIO"`，避免 `scenarioId` 与 `planId` 数值碰撞造成的跨类型误匹配。
+
+#### 4.6.4 AI 生成 Cron
+**抽到 `test-mng-common` 公共模块**，UI 测试计划与 API 测试计划共用。
 - 公共类位置：`cloud.aisky.service.CronAiGenerator`（接口）+ `cloud.aisky.service.impl.CronAiGeneratorImpl`
 - 入参：自然语言描述（如"每天早上9点"）+ 当前用户/企业上下文
 - 出参：`{ cronExpression, cronDescription }`
@@ -453,8 +598,6 @@ CREATE TABLE tb_api_test_plan (
                   COMMENT '执行模式: SERIAL | PARALLEL',
   parallel_limit  INT           NOT NULL DEFAULT 5
                   COMMENT '并行上限（PARALLEL 模式生效，默认 5）',
-  cron_enabled    TINYINT(1)    NOT NULL DEFAULT 0 COMMENT '是否启用定时',
-  cron_expression VARCHAR(64)   DEFAULT NULL COMMENT 'Cron 表达式',
   create_user_id  BIGINT        DEFAULT NULL,
   modify_user_id  BIGINT        DEFAULT NULL,
   create_time     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -463,9 +606,10 @@ CREATE TABLE tb_api_test_plan (
   deleted         TINYINT(1)    NOT NULL DEFAULT 0 COMMENT '逻辑删除',
   PRIMARY KEY (id),
   KEY idx_library_deleted (case_library_id, deleted),
-  KEY idx_enterprise_deleted (enterprise_id, deleted),
-  KEY idx_cron_enabled (cron_enabled) COMMENT '用于启动时扫表加载定时'
+  KEY idx_enterprise_deleted (enterprise_id, deleted)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='接口测试计划';
+
+-- 注：定时执行（cron）相关字段不放在本表，统一复用 tb_scenario_schedule_task（详见 §4.6 / §5.5）
 ```
 
 ### 5.2 `tb_api_test_plan_item` — 计划条目
@@ -554,13 +698,62 @@ CREATE TABLE tb_api_test_plan_execution_item (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='接口测试计划执行条目结果';
 ```
 
-### 5.5 索引策略
+### 5.5 `tb_scenario_schedule_task` — 复用扩展（**不新建表**）
+为承载测试计划的定时任务，对**现有**的 `tb_scenario_schedule_task`（位于 `test-mng-api-test-execution`）做最小扩展。完整迁移文件：`test-mng-api-test/src/main/resources/db/migration/V20260427__schedule_task_unification.sql`
+
+```sql
+-- 1. 加 task_type 列 + 索引
+ALTER TABLE tb_scenario_schedule_task
+  ADD COLUMN task_type VARCHAR(16) NOT NULL DEFAULT 'SCENARIO'
+       COMMENT '任务类型: SCENARIO=场景定时, TEST_PLAN=测试计划定时' AFTER id,
+  ADD INDEX idx_task_type_space (task_type, space_id);
+
+-- 2. environment_id 从 NOT NULL 改为 NULL-able（TEST_PLAN 类型时为 NULL）
+ALTER TABLE tb_scenario_schedule_task
+  MODIFY COLUMN environment_id BIGINT DEFAULT NULL
+       COMMENT '关联环境ID（TEST_PLAN 类型时为 NULL）';
+
+-- 3. 把 tb_api_test_plan 已有的 cron 配置迁移到 schedule_task（task_type='TEST_PLAN'）
+INSERT INTO tb_scenario_schedule_task (id, task_type, space_id, task_name, scenario_id,
+       environment_id, cron_expression, task_status, ...)
+SELECT id, 'TEST_PLAN', space_id, CONCAT(plan_name, ' - 定时任务'), id,
+       NULL, cron_expression, 1, ...
+FROM tb_api_test_plan WHERE cron_enabled = 1 AND deleted = 0;
+
+-- 4. 删除 tb_api_test_plan 的 cron_enabled / cron_expression 字段及索引
+ALTER TABLE tb_api_test_plan
+  DROP INDEX idx_cron_enabled,
+  DROP COLUMN cron_expression,
+  DROP COLUMN cron_enabled;
+```
+
+**字段语义复用对照表**：
+
+| 字段 | `task_type=SCENARIO` | `task_type=TEST_PLAN` |
+|---|---|---|
+| `scenario_id` | 场景 id | **计划 id**（字段名误导但不改名，避免大面积影响；DAO 层用 getter 包装语义） |
+| `scenario_name` | 场景名 | 计划名（快照） |
+| `task_name` | 任务名 | 任务名 |
+| `environment_id` | 环境 id | **NULL**（环境在 plan 的 item 级覆盖，plan 级无统一环境） |
+| `cron_expression` | 通用 | 通用 |
+| `task_status` | 1/0 | 1/0 |
+| `last_execute_time` / `next_execute_time` / `last_execute_status` / `last_execution_id` | 通用 | 通用 |
+| `space_id` / `enterprise_id` / `create_user_*` / `*_time` / `deleted` | 通用 | 通用 |
+
+**好处**：
+- 无需新建表；无需给 `tb_api_test_plan` 加任何 cron 字段
+- 调度器（`ScenarioScheduleScheduler` / `ScheduleTaskExecutor`）+ Redisson 分布式锁逻辑全部复用，只在 `doExecute` 加 `switch(task_type)` 分支
+- 表结构上一对多（一个 plan 可挂多条定时），但**前端 UI 1:1**（计划详情面板对齐 UiTestPlan，详见 §3.6.3）
+
+**为什么不改字段名**：`tb_scenario_schedule_task` 现已被场景定时任务大量代码使用，改名涉及 entity / mapper / DTO / VO / controller / 前端 API + interface 一连串重命名。出于改动半径考虑，仅加一列、不改名；新代码（`ApiTestPlanScheduleTaskController`）通过包装层把 `scenarioId` 字段语义还原为 `planId`，对前端隐藏底层共表事实。
+
+### 5.6 索引策略
 - 列表查询最常见：按 `(case_library_id, deleted)` + keyword LIKE → 前两个覆盖到，keyword 全表扫也能接受（每个 library 计划数量不会太大）
 - 条目按 plan 查询 + 排序：`(plan_id, sort_order)`
 - 启动恢复扫描：`(status = 'running')` 的执行记录 → `idx_status`
-- 定时任务启动加载：`(cron_enabled = 1)` → `idx_cron_enabled`
+- 定时任务启动加载：`task_status=1 AND deleted=0` → 复用 `tb_scenario_schedule_task` 已有索引；按类型筛查走 `idx_task_type_space`
 
-### 5.6 外键与软删策略
+### 5.7 外键与软删策略
 - **不建物理外键**（符合项目现有约定，避免分库分表阻塞）
 - 所有表都带 `deleted TINYINT`（`@TableLogic`），`create_time / update_time` 自动填充
 - `plan` 删除时级联软删其 `item`（业务层做，一个事务内两次 update）
@@ -581,20 +774,22 @@ CREATE TABLE tb_api_test_plan_execution_item (
 | 执行引擎 | Python midscene 子进程 + YAML | 复用 Java 原生 `ApiCaseExecutionService` / `ScenarioExecutionService` |
 | WebSocket | `/ui-test/api/v1/ws/logs/{id}` | `/api-test-execution/v1/ws/logs/{id}`（协议相同，多 `item_*` 事件） |
 | 报告 | 执行历史列表 | 同左 + 本期预留 `execution_item` 表供后续报告使用 |
+| 定时调度（存储） | cron 内嵌 plan 表 + 独立调度器 | **复用** `tb_scenario_schedule_task` 表（加 `task_type` 字段）；与场景定时共用调度器/Redis 锁/列表入口 |
+| 定时调度（UI） | 内联 cron section（switch + 输入 + AI 生成 + 示例 + 预览 + 下 5 次） | **完全对齐**：内联 cron section 复用同款 UX；底层切换为 schedule_task 接口（1:1 模型） |
 
 ---
 
-## 7. 实施计划（建议分 4 个 PR）
+## 7. 实施计划（建议分 6 个 PR）
 
 ### PR-1：数据库 + 后端骨架
-- Flyway 迁移：上面 4 张表
+- Flyway 迁移：本文档 §5.1–§5.4 共 4 张新表
+- `tb_scenario_schedule_task` 扩列：加 `task_type` + `idx_task_type_space`（§5.5）
 - Entity / Mapper / Converter 脚手架
 - Controller 空实现 + Knife4j 接口描述
 
 ### PR-2：CRUD + 导入/排序/环境
 - 计划 CRUD、条目导入、批量操作
 - Feign 获取 ApiCase / Scenario 名称与默认环境
-- 定时调度（不含执行引擎真正跑，只打点触发）
 
 ### PR-3：执行引擎 + WebSocket
 - `PlanRunner`（串行 + 并行 + 取消）
@@ -602,18 +797,27 @@ CREATE TABLE tb_api_test_plan_execution_item (
 - 与已有 `ApiCaseExecutionService`、`ScenarioExecutionService` 的对接
 - 服务启动时扫 `status=running` 的 execution → 置 `cancelled`（防服务器 crash 留下僵尸记录）
 
-### PR-4：前端
+### PR-4：定时任务（共用表）
+- `ApiTestPlanScheduleTaskController` + create/update/list/detail（写入 `tb_scenario_schedule_task` 时 `task_type='TEST_PLAN'`）
+- `ScheduleTaskExecutor.doExecute` 加 `task_type` 分支：`TEST_PLAN` 调 `PlanRunner.run(...)`
+- 现有 `/scenario-schedule-task/list` 接口加可选 `taskType` 入参 + VO 增加 `taskType` 字段返回
+- 验证 `ScenarioScheduleScheduler.init()` 启动加载兼容（不需要改，按 `task_status=1 AND deleted=0` 扫所有类型）
+
+### PR-5：前端
 - `ApiTestPlan.vue` + store + api module
 - `SceneIndex.vue` 新增 tab
 - `case/detail/index.vue` 顶部按钮条件渲染
 - 拖拽排序、批量设置环境 UI
+- **内联 cron section（§3.6.3）**：`ApiTestPlan.vue` 计划详情面板的"定时执行" section 与 UiTestPlan 完全 1:1 一致；底层接 `apiTestPlanScheduleTask` API
+- **「定时任务」tab 改造（§3.6）**：`SceneScheduleTask.vue` 加类型列、操作列分支；新增 `ApiTestPlanScheduleTaskDialog.vue`（仅供「定时任务」tab 行编辑）；`ScheduleTaskDialog.vue` list 调用加 `taskType: "SCENARIO"` 过滤
 
-> **前端实现提示**：直接复制 `UiTestPlan.vue` 改名，大量代码（CommonPlanList、右键菜单、Cron 配置、WebSocket、状态持久化）可以 1:1 保留，主要工作集中在：
+> **前端实现提示**：直接复制 `UiTestPlan.vue` 改名，大量代码（CommonPlanList、右键菜单、WebSocket、状态持久化、**整段 cron section 模板/CSS**）可以 1:1 保留，主要工作集中在：
 > 1. 删掉 YAML 预览相关代码
-> 2. 增加"执行模式"section
-> 3. 条目列表改为两类来源 + 拖拽 + 批量设置环境
+> 2. cron 后端调用从 `updateUiTestPlanApi(cronEnabled/cronExpression)` 改为 `apiTestPlanScheduleTask` 接口（详见 §3.6.3 实现要点）
+> 3. 增加"执行模式"section
+> 4. 条目列表改为两类来源 + 拖拽 + 批量设置环境
 
-### PR-5：测试报告集成（详见 §10）
+### PR-6：测试报告集成（详见 §10）
 - `tb_test_report` 扩列：`trigger_type` / `test_plan_id` / `test_plan_name` / `test_plan_execution_id`
 - `tb_api_test_plan_execution` 加 `test_report_id` 反向引用
 - `TestReportController` 新增 `/create/plan` 内部接口
@@ -872,7 +1076,7 @@ export interface TestReportListDTO {
 - **删除联动**：删除 plan → 不删除其报告（保留审计）；删除 report → 不影响 plan execution（仅清掉双向引用）
 - **PDF 导出**：现有 `/test-report/export/pdf` 需对 `TEST_PLAN` 类型新增模板（计划级汇总 + 条目表）
 - **统计接口**：`getTestReportStatisticsApi` 当前按 spaceId 全量统计，可加 `reportType` 维度细分（前端可视化用，本期可不做）
-- **PR 拆分**：建议作为原 PR-3（执行引擎）之后的 **PR-5** 单独提交，与 plan 主流程解耦，便于灰度
+- **PR 拆分**：建议作为 **PR-6** 单独提交（在前端 PR-5 之后），与 plan 主流程解耦，便于灰度
 
 ### 10.8 与原文档 §8.2 的关系
 原文档 §8.2 提到"测试报告模块（聚合 `tb_api_test_plan_execution_item`，展示接口详情、断言、变量提取、响应体差异）"作为后续扩展，本节将其落地，并明确：
