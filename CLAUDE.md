@@ -10,10 +10,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 test-mng/
 ├── test-mng-service/   # 后端（Spring Cloud 微服务聚合工程，独立 git 仓库）
 ├── test-mng-web/       # 前端（Vue 3 单页应用，独立 git 仓库）
+├── docs/               # 跨模块/全局设计文档（业务模块说明、设计方案等，新写的 MD 都放这里）
 └── script/             # 一键启动脚本（前后端）
 ```
 
 **在不同子项目工作时，优先遵循该子项目自己的 `CLAUDE.md`（以下链接），根目录文档只提供跨模块/全局视角。**
+
+**新建跨模块/全局文档统一放到 `docs/` 目录**（已有：`API_TEST_PLAN_DESIGN.md` / `API_TEST_PLAN_ISSUES.md` / `API_TEST_PLAN_PROGRESS.md`）。子项目内部的设计文档仍留在各自子项目下。
 
 - 后端规范：[test-mng-service/CLAUDE.md](test-mng-service/CLAUDE.md)
 - 前端规范：[test-mng-web/CLAUDE.md](test-mng-web/CLAUDE.md)
