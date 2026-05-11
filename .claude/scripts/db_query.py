@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-db_query.py — 查询团队 dev MariaDB 的命令行工具
-配套 skill: .claude/skills/query-dev-db.md
+db_query.py — 查询团队 dev / fat MariaDB 的命令行工具
+配套 skill: .claude/skills/query-db.md
 
 默认只读（SELECT/SHOW/DESCRIBE/EXPLAIN/USE），DDL/DML 必须显式 --confirm。
+通过 --env 切换环境：dev（默认，每个微服务独立账号）/ fat（统一 root 账号）。
 """
 import argparse
 import json
@@ -13,20 +14,33 @@ import sys
 import pymysql
 import pymysql.cursors
 
-HOST = "dev-mariadb.imchenr1024.com"
-PORT = 13307
-
-# 库名 -> (用户名, 密码)
-# 规则：账号 = 库名；密码各库独立
-DB_CREDS = {
-    "tp_system": ("tp_system", "rYFi8p2Ak4dW8NYF"),
-    "tp_auth": ("tp_auth", "5bKMtkkhxb3GWEpz"),
-    "tp_functional": ("tp_functional", "Zyz8HZsDSjR4a55D"),
-    "tp_storage": ("tp_storage", "MzneehQNcBY8JTPR"),
-    "tp_interface": ("tp_interface", "arGtWAWcRsGJbZAb"),
-    "tp_task": ("tp_task", "t6kSKrhQMMsNQjit"),
-    "tp_code_review": ("tp_code_review", "HSn3jQs5mHi6EsXn"),
-    "tp_ui_test_base": ("tp_ui_test_base", "tx7b5e7FETxMAeB3"),
+# 环境配置
+# - creds：库名 -> (用户名, 密码)，库专属凭据
+# - default_creds：(用户名, 密码) 或 None；当 --db 不在 creds 时回退到该凭据
+#   * dev：账号 = 库名，密码各库独立，没有 default_creds
+#   * fat：单一 root 账号可访问所有库
+ENVS = {
+    "dev": {
+        "host": "dev-mariadb.imchenr1024.com",
+        "port": 13307,
+        "creds": {
+            "tp_system": ("tp_system", "rYFi8p2Ak4dW8NYF"),
+            "tp_auth": ("tp_auth", "5bKMtkkhxb3GWEpz"),
+            "tp_functional": ("tp_functional", "Zyz8HZsDSjR4a55D"),
+            "tp_storage": ("tp_storage", "MzneehQNcBY8JTPR"),
+            "tp_interface": ("tp_interface", "arGtWAWcRsGJbZAb"),
+            "tp_task": ("tp_task", "t6kSKrhQMMsNQjit"),
+            "tp_code_review": ("tp_code_review", "HSn3jQs5mHi6EsXn"),
+            "tp_ui_test_base": ("tp_ui_test_base", "tx7b5e7FETxMAeB3"),
+        },
+        "default_creds": None,
+    },
+    "fat": {
+        "host": "47.109.54.181",
+        "port": 23307,
+        "creds": {},
+        "default_creds": ("root", "mariadb_4NWCkt"),
+    },
 }
 
 READ_ONLY_PREFIXES = {"SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "USE"}
@@ -47,17 +61,27 @@ def is_read_only(sql: str) -> bool:
     return True
 
 
-def get_conn(db: str):
-    if db not in DB_CREDS:
+def get_conn(env: str, db: str):
+    if env not in ENVS:
         print(
-            f"❌ Unknown database '{db}'. Known: {sorted(DB_CREDS)}",
+            f"❌ Unknown env '{env}'. Known: {sorted(ENVS)}",
             file=sys.stderr,
         )
         sys.exit(2)
-    user, pwd = DB_CREDS[db]
+    cfg = ENVS[env]
+    if db in cfg["creds"]:
+        user, pwd = cfg["creds"][db]
+    elif cfg["default_creds"]:
+        user, pwd = cfg["default_creds"]
+    else:
+        print(
+            f"❌ Unknown database '{db}' in env '{env}'. Known: {sorted(cfg['creds'])}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     return pymysql.connect(
-        host=HOST,
-        port=PORT,
+        host=cfg["host"],
+        port=cfg["port"],
         user=user,
         password=pwd,
         database=db,
@@ -81,8 +105,8 @@ def render_table(rows):
     print(f"\n({len(rows)} rows)")
 
 
-def run_sql(db: str, sql: str, as_json: bool):
-    with get_conn(db) as conn:
+def run_sql(env: str, db: str, sql: str, as_json: bool):
+    with get_conn(env, db) as conn:
         with conn.cursor(pymysql.cursors.DictCursor) as cur:
             cur.execute(sql)
             try:
@@ -102,12 +126,19 @@ def run_sql(db: str, sql: str, as_json: bool):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Query dev MariaDB (read-only by default)."
+        description="Query dev/fat MariaDB (read-only by default)."
+    )
+    parser.add_argument(
+        "--env",
+        default="dev",
+        choices=sorted(ENVS),
+        help="Environment to connect to (default: dev).",
     )
     parser.add_argument(
         "--db",
         default="tp_system",
-        help="Database name (default: tp_system). Known: " + ", ".join(sorted(DB_CREDS)),
+        help="Database name (default: tp_system). dev creds: "
+        + ", ".join(sorted(ENVS["dev"]["creds"])),
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--sql", help="SQL to execute (string).")
@@ -142,7 +173,7 @@ def main():
         print(f"SQL: {sql.strip()}", file=sys.stderr)
         sys.exit(3)
 
-    run_sql(args.db, sql, args.json)
+    run_sql(args.env, args.db, sql, args.json)
 
 
 if __name__ == "__main__":

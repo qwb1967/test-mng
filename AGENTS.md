@@ -82,7 +82,7 @@ test-mng/
   | ui-auto | `tp_ui_test_base` | `tx7b5e7FETxMAeB3` |
 
 - 其它模块的库 / 密码以 Nacos 配置为准（在 Nacos 控制台搜对应 `*.yml` 中的 `spring.datasource.*`）。
-- **直接查 dev MariaDB**：用 `.Codex/skills/query-dev-db.md` + `.Codex/scripts/db_query.py`（默认只读，DDL/DML 须 `--confirm`）。
+- **直接查 dev / fat MariaDB**：用 `.Codex/skills/query-db.md` + `.Codex/scripts/db_query.py`（默认只读，DDL/DML 须 `--confirm`；`--env dev|fat` 切换环境）。
 
 **团队 dev Redis 访问信息**：
 

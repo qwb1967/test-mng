@@ -1164,7 +1164,7 @@ ALTER TABLE tb_api_case
     COMMENT 'case 执行时是否走 mock（v1.2 D9）：0=OFF（直接打真实）/ 1=ON（执行引擎给请求加 X-Mock-Enabled Header）' AFTER <某字段>;
 ```
 
-⚠️ **DDL 落地前**用 query-dev-db skill 确认 `tb_space` / `tb_api_case` 当前列结构再决定 `AFTER <某字段>` 放哪。
+⚠️ **DDL 落地前**用 query-db skill 确认 `tb_space` / `tb_api_case` 当前列结构再决定 `AFTER <某字段>` 放哪。
 
 #### 10.4.2 跨模块责任划分
 
