@@ -1,19 +1,75 @@
 ---
 name: git-flow
-description: test-mng 项目分支管理、commit、push、合并发布的操作指南。基于团队《研发迭代规范》(Git-Flow 模型)，覆盖 feature/develop/release/master/hotfix 全流程，含分支命名、commit message 格式、各仓库 Owner、与环境映射、Codeup PR 流程。用户提到"建分支 / 提交 / push / 合并 / 发 dev/fat/uat / 线上修复 / 工单 ASAIO-xxx"时触发。
+description: test-mng 仓库分支管理、commit、push、合并发布的操作指南。涵盖两类仓库：(1) 根目录 test-mng（个人 GitHub 仓库，简单直 push main）、(2) 子目录 test-mng-service / test-mng-web（团队 Codeup 仓库，严格 Git-Flow：feature/工单号 → develop → release → master）。用户提到"建分支 / 提交 / push / 合并 / 发 dev|fat|uat / 线上修复 / 工单 ASAIO-xxx"时触发。
 ---
 
 # git-flow — test-mng 分支管理 & 提交 & 发布操作指南
 
-> 📌 团队采用 **Git-Flow** 分支模型，配套云效工单 + Codeup 仓库（**不是** GitHub，`gh` CLI 不可用）。
-> 📌 test-mng 是聚合 monorepo，但 `test-mng-service/` 和 `test-mng-web/` **各自有独立 .git**，操作时务必先 `cd` 到对应子目录。
+## ⚠️ 第一步：先判断是哪个仓库
+
+test-mng 目录下有**三个独立 git 仓库**，规范完全不同。**做任何 git 操作前先判断**：
+
+| 仓库 | `.git` 位置 | 托管 | 流程 |
+|------|------------|------|------|
+| **根目录 `test-mng`**（个人） | `test-mng/.git` | **GitHub** `qwb1967/test-mng` | 简单：直接 commit + push `main`，**不挂工单、不建分支、不走 develop/release** |
+| **`test-mng-service`**（团队后端） | `test-mng-service/.git` | **Codeup** | 严格 **Git-Flow**：见下文（feature/工单号 → develop → release → master）|
+| **`test-mng-web`**（团队前端） | `test-mng-web/.git` | **Codeup** | 严格 **Git-Flow**：同上 |
+
+**判断方式**：
+
+```bash
+# 看用户改动的文件路径在哪个仓库下
+# 改 CLAUDE.md / .claude/skills/* / docs/* / script/*  → 根目录仓库（个人）
+# 改 test-mng-service/**  → 团队后端仓库（Codeup）
+# 改 test-mng-web/**       → 团队前端仓库（Codeup）
+
+# 验证：
+git -C <仓库根> remote -v   # github.com → 个人；codeup → 团队
+```
+
+> ⚠️ **不要混淆**：根目录的 `CLAUDE.md` / `.claude/` 是个人仓库的；`test-mng-service/CLAUDE.md`、`test-mng-web/CLAUDE.md` 是团队仓库的（团队共享，**我们不改**）。
+
+---
+
+## 一、根目录 test-mng（个人 GitHub 仓库）
+
+**用途**：维护我们自己的 CLAUDE.md、`.claude/` 下的 skills 与 scripts、docs/ 跨模块文档、script/ 启动脚本。
+
+**规则（很简单）**：
+
+- 分支：直接在 `main` 上工作
+- 不挂工单号、不建 feature 分支
+- commit message：简短中文 / `<type>: 说明` 即可，参考最近 commit 风格（`完善md` / `新增AGENTS.md` / `docs: 测试计划定时任务设计同步`）
+- 直接 `git push origin main`，没人 review
+
+**典型流程**：
+
+```bash
+cd /Users/qianwenbo/IdeaProjects/test-mng    # 仓库根（即 test-mng/）
+git status                                    # 看改动
+git add CLAUDE.md .claude/skills/xxx.md       # 按具体文件 add，不要 git add .
+git commit -m "完善 CLAUDE.md xxx"
+git push origin main
+```
+
+**注意事项**：
+
+- **`.DS_Store`** 不要 add（macOS 系统文件，应忽略）
+- 这个仓库**不追踪**子目录内容：`test-mng-service/` 和 `test-mng-web/` 在根仓库眼里是被忽略的（它们有自己的 `.git`）。所以改了子目录的文件，`git -C test-mng status` 看不到，要 `git -C test-mng-service status` 或 `git -C test-mng-web status`
+
+---
+
+## 二、团队仓库（test-mng-service / test-mng-web，Codeup）
+
+> 📌 团队采用 **Git-Flow** 分支模型，配套云效工单。仓库托管在 **Codeup**（**不是** GitHub，`gh` CLI 不可用）。
+> 📌 操作时务必先 `cd` 到对应子目录（或用 `git -C test-mng-service ...`）。
 
 ## 何时触发
 
 用户出现以下意图时调用本 skill：
 
 - "新需求开始开发了 / 帮我建个分支 / 拉 feature 分支"
-- "这次 commit message 怎么写 / 帮我提交"
+- "这次 commit message 怎么写 / 帮我提交"（**先判断是哪个仓库**，根目录走简化流程）
 - "把这个 push 上去 / 推到远端"
 - "合并到 develop / release / master"
 - "发 dev / fat / uat 环境怎么走"
