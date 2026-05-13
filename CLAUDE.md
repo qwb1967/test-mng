@@ -41,13 +41,14 @@ test-mng/
 | `test-mng-storage` | 文件存储（S3 兼容）|
 | `test-mng-task-center` | 任务中心（调度、异步执行）|
 | `test-mng-license-core` / `test-mng-license-issuer` | License 核心库 / 签发服务 |
-| `test-mng-common` | 共享代码（Result、PageResult、BusinessException、MyBatis Plus 基类等）|
+| `test-mng-common` | 共享代码（`JsonDataVO`、`PageDataVO`、`BizException` + `BizCodeEnum`、MyBatis Plus 基类等）|
 
 **关键架构约定**（详见后端 CLAUDE.md）：
 
 - 包命名：`cloud.aisky.{module}.{controller|service|mapper|entity|dto|vo|enums|config|handler}`
 - 分层：Controller → Service/ServiceImpl → Mapper (`BaseMapper`)；Entity ↔ DTO ↔ VO 用 Converter 显式转换
-- Controller 统一返回 `Result<T>`，分页返回 `PageResult<T>`，业务异常抛 `BusinessException`，全局异常处理在 `@RestControllerAdvice`
+- Controller 统一返回 `JsonDataVO<T>`（`new JsonDataVO<T>().buildSuccess(data)` / `.buildError(msg)` / `.buildResult(BizCodeEnum.X)`），分页返回 `JsonDataVO<PageDataVO<T>>`；业务异常抛 `BizException`（配 `BizCodeEnum`，业务码 6 位、前两位是服务编号），全局异常处理在 `@RestControllerAdvice`
+- 表前缀：实体表 `tb_xxx`，关联关系表 `tr_xxx`；主键统一 `@TableId(type = IdType.ASSIGN_ID)`（雪花）；逻辑删除字段加 `@TableLogic`；当前登录用户在 Controller 用 `SessionUtils.getCurrentUserId()` 取，再传给 Service
 - 依赖注入用 `@RequiredArgsConstructor` + `final` 字段（不用字段级 `@Autowired`）
 - 校验用 `@Valid` + Jakarta Validation 注解；DTO/VO 字段必须带 `@Schema` 描述（见用户 memory `feedback_dto_vo_schema.md`）
 - 分页统一用 MyBatis Plus 的 `Page` + `LambdaQueryWrapper`
@@ -89,6 +90,45 @@ test-mng/
 
 - Host / Port：`dev-redis.imchenr1024.com:16379`
 - 密码：`redis_5285Aw`
+
+### 数据库设计红线（新增表 / 字段 / 索引时必读）
+
+> 来源：团队《研发迭代规范》。Claude 写 DDL 或 Entity 时严格遵守，违反任何一条都要主动指出并修正。
+
+**硬性要求（必须）**：
+
+- 库 / 表 / 字段 / 索引名 **全小写**，禁用 MySQL 关键字
+- 实体表名前缀 `tb_`，关联关系表前缀 `tr_`（例：`tb_api_case` / `tr_user_role`）
+- 主键统一：`id` `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT`（实体类用 `@TableId(type = IdType.ASSIGN_ID)`），**禁止组合主键**
+- 所有字段 `NOT NULL` + 默认值（数值 `0`，字符串 `''`）
+- 所有表必须有 `create_time` `DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP`、`modify_time` `DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+- 所有表必须为 `modify_time` 建普通索引 `ix_modify_time(modify_time)`
+- 所有表 / 字段必须写 `COMMENT`
+- 时间类型用 `DATETIME`（**不用 `TIMESTAMP`**，避免时区性能损耗 + 2038 问题）
+- 索引命名：非唯一 `ix_<字段>[_字段]`，唯一 `uk_<字段>[_字段]`
+- JOIN 关联字段类型必须一致并建索引
+
+**强烈建议**：
+
+- `VARCHAR(N)` 的 N 尽量小、`N < 255`
+- 用 `TINYINT` 替代 `ENUM`，字段 `COMMENT` 注明值含义（如 `0-不通过 / 1-通过`）
+- 逻辑删除：加 `deleted` 字段 + `@TableLogic`，**禁止物理 `DELETE`**
+- 单表数据量控制在千万级以下，超量提前规划归档
+- 组合索引把高区分度字段放左边
+
+**绝对禁止**：
+
+- 删字段 / 删表 / 改字段名 / 改字段类型 / 改字段顺序（**只允许新增字段**，新增禁用 `AFTER` / `BEFORE`）
+- `INSERT INTO ... SELECT`（会锁表）
+- 无 `ORDER BY` 的 `UPDATE/DELETE ... LIMIT ...`
+- 超过 2 张表的 JOIN、子查询（`WHERE id IN (SELECT ...)`）
+- 外键、视图、存储过程、函数、触发器、事件
+- `ORDER BY RAND()`
+- **程序中执行任何 DDL**（建表/改表/删索引等都走工单，不能在代码里 `executeUpdate`）
+
+**分库分表命名**：自增数字补零（`tb_00`~`tb_99`）；按年 `tb_2025`；按月 `tb_202501`；按天 `tb_20250101`。
+
+> 💡 直接查 / 改 dev/fat MariaDB 用 `.claude/skills/query-db.md`（只读默认放行，DDL/DML 必须 `--confirm`）。
 
 ### 常用命令（后端）
 
