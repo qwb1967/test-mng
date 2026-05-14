@@ -83,7 +83,7 @@ git push origin main
 |------|------|---------|------|---------|
 | `feature/<工单ID>` | 单需求开发 | local | `feature/ASAIO-259` | 自测通过 → 合入 `develop`（需 Owner 评审）|
 | `develop` | 开发集成 | **dev** | 固定名 | feature → develop **需 Owner 评审** |
-| `release` | 版本发布 | **fat** | 例 `release/v0.4` | develop 自测通过 → 自行合入，**无需审核** |
+| `release` | 版本发布 | **fat** | 固定名 | develop 自测通过 → 自行合入，**无需审核** |
 | `bugfix/<工单ID>` | fat 上发现的 bug | fat | `bugfix/ASAIO-301` | 从 `release` 拉，修复后合回 `release`；简单 bug 也可直接在 release 上改 |
 | `master` | 已发布基线 | **uat** | 固定名 | QA 通过 → **通知余晨**合入 |
 | `hotfix/<工单ID>` | 线上严重缺陷临时修复 | 生产 | `hotfix/ASAIO-400` | **余晨**从 master 拉，修复后合回 `develop` 和 `master` |
@@ -147,16 +147,16 @@ git push -u origin feature/ASAIO-259    # 首次 push 加 -u
 #   B) 本地操作并通知 Owner（团队实际灵活做法）
 # 合入后由各模块部署到 dev 环境
 
-# === 6. dev 自测通过 → 合入对应版本的 release（fat 环境）===
-git checkout release/v0.4
-git pull origin release/v0.4
+# === 6. dev 自测通过 → 合入 release（fat 环境）===
+git checkout release
+git pull origin release
 git merge feature/ASAIO-259
-git push origin release/v0.4
+git push origin release
 # 此步无需审核，发布 fat 后通知 QA
 
 # === 7. fat 发现 bug ===
 # 方式 A：从 release 拉 bugfix 分支（命名同 feature）
-git checkout release/v0.4
+git checkout release
 git checkout -b bugfix/ASAIO-301
 # ...改完...
 git commit -m "fix: #ASAIO-301 修复 xxx"
@@ -165,7 +165,7 @@ git push -u origin bugfix/ASAIO-301
 # 方式 B：确认一把过的小修复，可直接在 release 改完 push
 
 # === 8. release 测试完成 → 通知 QA，QA 通知余晨合并 master ===
-# 余晨：git checkout master; git merge release/v0.4; git push origin master
+# 余晨：git checkout master; git merge release; git push origin master
 # 聂淮生：发 UAT
 ```
 
@@ -209,6 +209,8 @@ git checkout develop && git merge hotfix/ASAIO-400 && git push
 - 缺陷版本号 每周发布递增
 - 时间版本号 取最终发布日期（如 12 月 20 日 → `1220`）
 
+> ⚠️ 版本号只用于发布标识（部署、tag、云效记录），**不进入分支名**。`release` 是固定分支，**不要**写成 `release/v0.4` / `release/v1.12.31` 之类的形式。
+
 ## 不该做的事
 
 - ❌ `git push --force` 到 develop / release / master（除非用户明确要求并知晓后果）
@@ -226,7 +228,7 @@ git checkout develop && git merge hotfix/ASAIO-400 && git push
 | "帮我提交一下" | 检查改动 → 写符合 `<type>: #ASAIO-xxx 说明` 格式的 message → 让用户确认后再 commit |
 | "推上去" | `git push -u origin <当前分支名>`；如果是 develop/release/master，**先停下来确认** |
 | "合到 develop" | 说明需 Owner 评审（后端找余晨 / 前端找段忠志或余晨），引导走 Codeup MR |
-| "发 fat" | 合到对应 `release/vX.Y` 分支（无需审核），push 后通知 QA |
+| "发 fat" | 合到 `release` 分支（固定名，**不是** `release/vX.Y`），无需审核，push 后通知 QA |
 | "线上挂了/紧急修一下" | 提示按 hotfix 流程走，且这是**余晨**的事，从 master 拉 `hotfix/ASAIO-XXX` |
 | "fat 上有 bug" | 从 `release` 拉 `bugfix/ASAIO-XXX`；小修复也可直接在 release 上改 |
 | 没工单号但想提交 | 停下，请用户去云效让陈霁/扬帆/聂淮生/小杨/余晨 之一补建需求卡片 |
