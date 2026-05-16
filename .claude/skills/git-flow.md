@@ -1,9 +1,24 @@
 ---
 name: git-flow
-description: test-mng 仓库分支管理、commit、push、合并发布的操作指南。涵盖两类仓库：(1) 根目录 test-mng（个人 GitHub 仓库，简单直 push main）、(2) 子目录 test-mng-service / test-mng-web（团队 Codeup 仓库，严格 Git-Flow：feature/工单号 → develop → release → master）。用户提到"建分支 / 提交 / push / 合并 / 发 dev|fat|uat / 线上修复 / 工单 ASAIO-xxx"时触发。
+description: test-mng monorepo（一个工作目录聚合 3 个独立 git 仓库）的分支管理、commit、push、合并发布操作指南。涵盖：(1) 根目录 test-mng（个人 GitHub 仓库，简单直 push main）、(2) 子目录 test-mng-service / test-mng-web（团队 Codeup 仓库，严格 Git-Flow：feature/工单号 → develop → release → master）。用户提到"建分支 / 提交 / push / 合并 / 发 dev|fat|uat / 线上修复 / 工单 ASAIO-xxx"时触发。
 ---
 
 # git-flow — test-mng 分支管理 & 提交 & 发布操作指南
+
+## 0. test-mng 是 monorepo（多仓聚合工作目录）
+
+`test-mng/` 本身**不是**一个 git 仓库，它是一个**聚合 3 个独立 git 仓库的工作目录**（multi-repo monorepo / multi-root workspace）：
+
+```
+test-mng/                          ← 工作目录（不是 git 仓库）
+├── .claude/  CLAUDE.md  docs/  script/   ← ① 根目录仓库（个人 GitHub）
+├── test-mng-service/.git                  ← ② 后端独立仓库（团队 Codeup）
+└── test-mng-web/.git                      ← ③ 前端独立仓库（团队 Codeup）
+```
+
+三个仓库**各有各的 `.git`、各有各的远端、各有各的分支模型**，git-flow 流程完全独立。
+
+> 💡 **单需求同时改前后端是常态**：那就要在 `test-mng-service` 和 `test-mng-web` **各走一遍下面的 git-flow，commit message 挂同一个工单号**。
 
 ## ⚠️ 第一步：先判断是哪个仓库
 
@@ -119,17 +134,36 @@ git push origin main
 - UAT 发布由 **聂淮生** 操作；
 - Demo 发布只能由 **聂淮生** 操作。
 
+## ⭐ 开新分支前的必跑前置（强制 4 步 SOP）
+
+**每次开始一个新需求 / 修一个 bug，开新分支前必须先做这 4 件事**——避免基于过期的 develop 工作、产生本可避免的合并冲突。
+
+```bash
+# 1. cd 到对应子仓（前/后端）；如同改前后端，两个子仓库各走一遍
+cd test-mng-service      # 或 cd test-mng-web
+
+# 2. 切到 develop
+git checkout develop
+
+# 3. 拉最新 develop（必跑，不省略）
+git pull origin develop
+
+# 4. 从最新的 develop 拉新分支
+git checkout -b feature/ASAIO-xxx     # 新需求
+# 或：
+git checkout -b bugfix/ASAIO-xxx      # bug 修复（fat 上发现的，规范从 release 拉；
+                                      #          dev 上 / 开发自测中发现的，团队也接受从 develop 拉）
+```
+
+**做完这 4 步就停下来，等用户的下一步指令**（写代码 / commit / push / 合并 / 发布）。不要替用户做超出"建分支"以外的操作；分支建好后，后续每一步都按用户指令推进。
+
+> ⚠️ 涉及前后端联动需求 → 在 `test-mng-service` 和 `test-mng-web` **各走一次这 4 步**，**两个仓库的 commit message 挂同一个工单号**。
+
 ## 标准开发流程（feature → dev → fat → uat）
 
 ```bash
-# === 0. 前置：确认在正确的子仓库 ===
-cd test-mng-service     # 或 test-mng-web
-git status              # 根目录 git status 无效，必须进子目录
-
-# === 1. 从 develop 拉 feature 分支 ===
-git checkout develop
-git pull origin develop
-git checkout -b feature/ASAIO-259    # 工单号严格按云效卡片来
+# === 0. 前置：4 步 SOP（见上一节）===
+# 即 cd 子仓 → checkout develop → pull origin develop → checkout -b feature/ASAIO-xxx
 
 # === 2. 本地开发 + 自测 ===
 # ... 写代码 ...
