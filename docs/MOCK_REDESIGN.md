@@ -50,7 +50,7 @@
 | # | 目标 | 衡量标准 |
 |---|---|---|
 | G1 | **URL 透明**：客户端真实 URL 不变 | Header `X-Mock-Enabled: true` 即可触发，不需要改 base URL |
-| G2 | **独立微服务**：脱离 `test-mng-api-test` | 新增 `test-mng-mock` 模块、独立部署（库复用 `tp_interface`，表前缀 `tb_mock_*` 隔离） |
+| G2 | **独立微服务**：脱离 `test-mng-api-test` | 新增 `test-mng-mock` 模块、独立部署、**独立库 `tp_mock`**（表前缀 `tb_mock_*`）|
 | G3 | **网关层接入**：流量分流在网关完成 | `test-mng-gateway` 增加 Mock 路由 Filter，命中 Header 的请求自动改写 routing |
 | G4 | **DSL 升级**：规则表达力全面增强 | 支持 `AND/OR/NOT`、跨字段条件、JsonPath、CEL 表达式 |
 | G5 | **多种响应模式**：静态 + 模板 + 脚本 + Faker + OpenAPI 范例 | 一条期望可声明响应类型 |
@@ -251,7 +251,7 @@ HTTP /mock/{spaceId}/...  ──▶  test-mng-gateway
                     ▼            ▼             ▼
               ┌──────────────┐   ┌─────────┐   ┌──────────────┐
               │ MySQL        │   │ Redis   │   │ MySQL        │
-              │ tp_interface │   │ 热缓存+  │   │ tp_interface │
+              │ tp_mock      │   │ 热缓存+  │   │ tp_mock      │
               │ (规则源)     │   │ 状态机+  │   │ (调用日志)   │
               │ tb_mock_*    │   │ pub/sub │   │ tb_mock_*    │
               └──────────────┘   └─────────┘   └──────────────┘
@@ -312,7 +312,7 @@ test-mng-mock/
     ├── dto/
     ├── vo/
     ├── enums/
-    │   ├── MockResponseTypeEnum.java                # STATIC / TEMPLATE / SCRIPT / FAKER / PROXY
+    │   ├── MockResponseTypeEnum.java                # STATIC / TEMPLATE / SCRIPT / FAKER / OPENAPI_EXAMPLE / MULTI（PROXY 已随 v1.2 D10 下线）
     │   ├── MockMatchModeEnum.java                   # SCENARIO / EXPECTATION / RANDOM / WEIGHTED
     │   └── MockChaosTypeEnum.java                   # LATENCY / ERROR_RATE / DROP_FIELD / RATE_LIMIT
     ├── config/                                       # Sa-Token / WebClient / Caffeine
@@ -436,9 +436,9 @@ X-Env-Id:   <currentEnvId>    ← 穿透时解析真实 URL
 |---|---|
 | `X-Env-Id` 不存在 | 400 + `{"code":400,"msg":"X-Env-Id Header missing"}` |
 | envId 在 api-test 查不到 | 400 + `{"code":400,"msg":"Environment <id> not found"}` |
-| envId 有效但 path 在该环境无匹配 service config | 404 + `X-Mock-Hit: passthrough_no_route` |
-| api-test InnerClient 调用失败 | 502 + `X-Mock-Hit: passthrough_failed` + `X-Mock-Reason: env_resolve_error` |
-| 真实后端连接失败 / 5xx / 超时 | 502 + `X-Mock-Hit: passthrough_failed` + `X-Mock-Reason: upstream_error` |
+| envId 有效但 path 在该环境无匹配 service config | 404 + `X-Mock-Hit: passthrough_no_route` + `X-Mock-Passthrough-Reason: env_no_route` |
+| api-test InnerClient 调用失败 | 502 + `X-Mock-Hit: passthrough_failed` + `X-Mock-Passthrough-Reason: env_resolve_error` |
+| 真实后端连接失败 / 5xx / 超时 | 502 + `X-Mock-Hit: passthrough_failed` + `X-Mock-Passthrough-Reason: upstream_error` |
 
 ---
 
@@ -455,6 +455,7 @@ X-Env-Id:   <currentEnvId>    ← 穿透时解析真实 URL
 | `X-Mock-Expectation` | ⭕ 调试用 | 强指定某条期望，跳过匹配 | `78421` |
 | `X-Mock-Delay` | ⭕ Chaos | 临时叠加延迟（毫秒），覆盖期望本身的 delay | `500` |
 | `X-Mock-Status` | ⭕ Chaos | 临时强制状态码 | `500` |
+| `X-Mock-Chaos` | ⭕ Chaos（P2）| 组合式故障注入，形如 `latency=500-2000;error_rate=0.1;drop_field=token`（详见 §8.4）| `latency=500` |
 | `X-Mock-Record` | ⭕ 录制 | `true` 时透传真实接口并落库为期望 | `true` |
 | `X-Mock-Trace` | ⭕ 调试 | `true` 时响应 Header 带 `X-Mock-Hit-Rule-Id` 等命中详情 | `true` |
 
@@ -532,33 +533,34 @@ public class MockRoutingFilter implements GlobalFilter, Ordered {
 | **匹配在哪做** | 网关 Filter 内做完匹配并直接返回 | 网关只分流，mock-service 做匹配 | ✅ B —— 隔离故障域，mock-service 可独立扩缩 |
 | **路径前缀** | 直接转发（mock-service 用 `/**` 拦截） | 加 `/__mock` 前缀（避免与 mock-service Admin API 冲突） | ✅ 加 `/__mock` 前缀 —— 数据面 / 配置面物理隔离 |
 | **Header 名字** | `Mock-Enabled` | `X-Mock-Enabled` | ✅ `X-` 前缀 —— 业界惯例 |
-| **失败兜底** | mock-service 返回特殊状态码 → 网关重试到业务 | mock-service 5xx → 网关 fallback | ✅ Spring Cloud Gateway `CircuitBreaker` + `fallbackUri`，确保 mock-service 故障不影响业务 |
+| **失败兜底** | mock-service 返回特殊状态码 → 网关重试到业务 | mock-service 5xx → 网关 fallback | ✅ P0 由 `MockRoutingFilter` 的 `onErrorResume` 捕获 mock-service 不可用 → 直接 503（修正 #8，详见 §5.4）；正式 CircuitBreaker 留待 P1 |
 
-### 5.4 fallback 兜底
+### 5.4 fallback 兜底（修正 #8）
 
-mock-service 不可用时，必须能让流量自动回落到原业务路由。在 `application.yml` 配置：
+> **单一路由机制**：mock 流量的路由统一由 §5.2 的全局 `MockRoutingFilter` 负责。**不再**额外声明一条带 `Header` predicate 的 route —— 因为 per-route 的 `CircuitBreaker` 过滤器只作用于"匹配到该 route"的流量，套不到全局 Filter 改写 URL attr 的流量上，两套机制并存会让熔断形同虚设；而 `fallbackUri: forward:/mock-fallback` 还需网关侧另配 controller，P0 没有就会返回 404 而非预期的 503。
 
-```yaml
-spring:
-  cloud:
-    gateway:
-      routes:
-        - id: mock-route-fallback
-          uri: lb://test-mng-mock
-          predicates:
-            - Header=X-Mock-Enabled, true
-          filters:
-            - name: CircuitBreaker
-              args:
-                name: mockServiceCircuitBreaker
-                fallbackUri: forward:/mock-fallback   # 触发降级时转回真实业务路由
+**P0 方案**：`MockRoutingFilter` 改写路由后，对 `chain.filter(exchange)` 挂错误兜底——mock-service 进程不可用（连接失败 / 超时）时直接回 503：
+
+```java
+// MockRoutingFilter.filter() 末尾，替换原来的 return chain.filter(exchange)
+// 注：gateway 是 Spring Cloud Gateway（WebFlux/reactive），此处 reactive 写法是对的；
+//     D3=A 的 servlet 约束只针对 mock-service，不针对网关
+return chain.filter(exchange).onErrorResume(ex -> {
+    log.warn("mock-service 不可用，fallback 503: {}", ex.getMessage());
+    ServerHttpResponse resp = exchange.getResponse();
+    resp.setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);          // 503
+    resp.getHeaders().add("X-Mock-Fallback", "unavailable");
+    byte[] body = "{\"code\":503,\"msg\":\"Mock Service Unavailable\"}"
+            .getBytes(StandardCharsets.UTF_8);
+    return resp.writeWith(Mono.just(resp.bufferFactory().wrap(body)));
+});
 ```
 
 **两类"不可用"区分**（v1.1 已确认）：
-- **mock-service 进程不可用 / 超时**：连接失败 / 5xx，由 CircuitBreaker 触发，走 `fallbackUri`，**P0 直接返回 `503 Mock Service Unavailable` + `X-Mock-Fallback: unavailable` Header**，客户端摘掉 `X-Mock-Enabled` 重试即可
-- **未匹配到任何期望**：业务 200，由 mock-service 内部返回 `404 / X-Mock-Hit: none` 标记响应，由客户端逻辑处理；**不走熔断**
+- **mock-service 进程不可用 / 超时**：连接失败 / 5xx，由上面的 `onErrorResume` 捕获，**P0 直接返回 `503 Mock Service Unavailable` + `X-Mock-Fallback: unavailable` Header**，客户端摘掉 `X-Mock-Enabled` 重试即可
+- **未匹配到任何期望**：**不属于"不可用"**——v1.2 D10 起走穿透（mock-service 内部转发真实业务，见 §4.5 / §6.2 [P]），不在网关兜底
 
-P2 再视情况实现"网关本地 controller 回查 Nacos + WebClient 转发到真实业务"的高级 fallback。
+P1/P2 再视情况引入正式的 Resilience4j `CircuitBreaker`（届时把路由也一并改成声明式 route，以便挂 per-route filter）+ "网关本地 controller 回查 Nacos + WebClient 转发真实业务"的高级 fallback。
 
 ---
 
@@ -597,6 +599,8 @@ public class MockRuntimeController {
 > P1 视压测量级（≥5K QPS / 单实例）再考虑 spike WebFlux 改造。
 >
 > **下方代码骨架原写的是 `Mono<ResponseEntity<byte[]>>`，落地时全部替换为同步 `ResponseEntity<byte[]>` + `HttpServletRequest`**，本文为减少改动暂保留 reactive 写法，实施时以 servlet 为准。
+>
+> ⚠️ **修正 #7**：§6.1 骨架里的 `onErrorResume(NoMatchException → 404)` 也已过时——v1.2 D10 起未命中不再返回 404，而是穿透（`match()` 抛 `PassthroughException`，由 `MockProxyService` 处理）。**运行时控制器与匹配逻辑一律以 §17.3 为准**，§6.1 仅示意 Controller 入口形态。
 
 ### 6.2 完整匹配流程
 
@@ -613,7 +617,8 @@ public class MockRuntimeController {
     ▼
 [2] 三级开关检查（v1.2 D8）
     ├─ 查 tb_space.enable_mock 是否 ON   → OFF：跳到 [P] 穿透
-    ├─ Radix Tree 找 tb_mock_api          → 不存在：跳到 [P] 穿透
+    ├─ Radix Tree 找 tb_mock_api（命中多个 PathPattern 时按"静态段优先于 {var} 段"取唯一一条，修正 #10）
+    │                                     → 不存在：跳到 [P] 穿透
     └─ 检查 tb_mock_api.enabled          → OFF：跳到 [P] 穿透
     │
     ▼
@@ -621,9 +626,11 @@ public class MockRuntimeController {
     若全部 expectation.enabled=0 → 跳到 [P] 穿透
     │
     ▼
-[4] 场景过滤
-    若 X-Mock-Scenario 存在，先过滤 expectation.scenarioId = 该场景
-    否则用接口的"默认场景"
+[4] 场景过滤（P1；P0 单一默认场景）
+    若 X-Mock-Scenario 存在 → 过滤出该场景的 expectation
+    否则 → 用接口的"默认场景"（tb_mock_api.default_scenario_id）
+    ⚠️ 修正 #9：指定场景内无任何期望命中时，回落到默认场景再匹配一轮，
+       默认场景也无命中才进 [P] 穿透（与 §3 流程 C 一致）
     │
     ▼
 [5] 强指定旁路（X-Mock-Expectation）
@@ -653,8 +660,9 @@ public class MockRuntimeController {
 ────────── 穿透分支 [P]（v1.2 D10，详见 §4.5）──────────
 
 [P1] MockProxyService 接管
-       in: (envId, spaceId, originalRequest, missReason)
-       missReason ∈ { space_disabled | api_not_found | api_disabled | no_match | all_expectations_disabled }
+       in: PassthroughException（携带 missReason + envId/spaceId/path/method + mockApiId/apiInfoId，见 §17.3）
+       匹配阶段 missReason ∈ { space_disabled | api_not_found | api_disabled | no_match | all_expectations_disabled }
+       穿透阶段失败再追加 { env_resolve_error | env_no_route | upstream_error }——完整集见 §17.1（统一对应 MissReason 枚举，修正 #12）
        │
        ▼
 [P2] 调 ApiTestInnerClient.resolveBaseUrl(envId, path, apiInfoId?)
@@ -850,7 +858,7 @@ X-Mock-Chaos: latency=500-2000;error_rate=0.1;drop_field=token
 
 | Chaos 类型 | 实现 |
 |---|---|
-| `latency` | 在响应前 `Mono.delay(...)`（**不能用 Thread.sleep**） |
+| `latency` | servlet 阻塞栈（D3=A）下直接 `Thread.sleep(ms)` 或用 `ScheduledExecutorService` 延迟返回——mock 是 thread-per-request，阻塞当前线程可接受（原"用 `Mono.delay`"是 reactive 残留，修正 #14）|
 | `error_rate` | 概率返回随机 5xx |
 | `drop_field` | 渲染响应后从 JSON 删字段 |
 | `rate_limit` | 接口级 Redis 计数器，超过阈值返回 429 |
@@ -908,6 +916,8 @@ request.headers["X-User-Id"] in [1001, 1002]
 
 > **互转能力的边界**：表单 → CEL 一定可生成；CEL → 表单**仅支持基础形态**（`a == b && c > d` 这类纯 AND 的简单条件，且每个原子条件都对应到「字段 + 操作符 + 字面量」）。包含 `||` 混合、嵌套 `exists()` / `all()`、自定义函数、函数返回值再比较的表达式**不保证可反推回表单**——此时 UI 自动切到"高级模式：仅 CEL 编辑"并在表单按钮上提示"当前条件含高级语法，已切到 CEL 模式"。
 
+> **缺失字段 / 非 JSON body 的求值语义（修正 #11）**：CEL 表达式引用 `request.body.xxx` 时，若 body 为空、不是 JSON、或字段不存在，**该条期望按"不匹配"处理（跳过、继续下一条），不抛错、不返回 500**。实现：① body 按 `Content-Type` 解析，非 JSON / 空 body 时 `request.body` 暴露为空 Map；② CEL 求值统一包 `evaluateSafe(...)`，捕获求值异常一律返回 false。这样"请求结构不符合预期"自然落到未命中 → 穿透，而不是把整个请求打挂。
+
 ### 9.3 IP 条件 / CIDR 匹配
 
 支持单 IP / CIDR / 黑白名单：
@@ -924,15 +934,15 @@ request.clientIp in cidrRange("10.0.0.0/24") || request.clientIp == "127.0.0.1"
 
 ### 10.1 库与 schema
 
-**复用现有 `tp_interface` 库**（不新建独立库），表前缀 `tb_mock_*` 与现有 `tb_api_*` 自带命名隔离。
+**新建独立库 `tp_mock`**（遵循团队 `tp_{module}` 命名约定，库名 = 用户名 = `tp_mock`），mock-service 专用；本章 6 张表全部落在 `tp_mock`，表前缀 `tb_mock_*`。
 
-> 决策依据（v1.1 已确认）：
-> - 现网 `api-test` 与 `api-test-execution` 已经是"两个微服务共用 `tp_interface`"的成熟模式，mock-service 沿用该模式
-> - mock 与接口管理同业务域，`tb_mock_api.api_info_id` → `tb_api_info.id` 同库后可加外键约束、便于 join
-> - 节省 P0 前置任务：不需要申请新库 / 新凭据 / 新 datasource / 在 `db_query.py` 加 DB_CREDS
-> - 调用日志膨胀风险靠 7 天 TTL + 单表行数控制；写入端抽象 `MockCallLogRepository`，量级真起来再迁移到独立库 / ClickHouse
+> 决策依据（v1.3 修订——原 v1.1 决策为"复用 `tp_interface`"，现反转为独立库）：
+> - **彻底的微服务边界**：G2 要求"独立微服务、独立部署"，库一并独立才算真正解耦——mock-service 与 api-test 的表结构演进、migration 节奏、备份与扩缩容策略从此互不牵制
+> - **故障域隔离**：mock 要被全平台模块（UI 自动化 / 性能测试 / 前端联调 / webhook 模拟）接入，需具备独立 SLA；与 api-test 共库时任一方的慢查询 / 锁 / 大事务会互相拖累
+> - **写入压力隔离**：`tb_mock_call_log` 每次 mock 命中 / 穿透都写一行，是高频写表；独立库后其写入 IO 与体积膨胀不影响接口管理库的性能与备份
+> - **跨库代价本就可接受**：独立库后 `tb_mock_*` 与 `tb_api_*` 不能加外键、不能 join——但团队数据库红线本就明令禁止外键、超过 2 张表的 JOIN 与子查询；唯一的跨域引用 `tb_mock_api.api_info_id → tb_api_info.id` 退化为**应用层软关联**（详见 §10.4）
 >
-> **未来何时迁出**：① 单日调用日志 > 100 万；② mock 服务被外部团队接入需要独立 SLA；③ 备份/扩缩策略与 api-test 出现明显分歧。
+> **代价（已纳入 §15 P0 前置任务）**：需申请新库 `tp_mock` + 独立账号 / 密码，在 dev Nacos 新增 datasource 配置，并在 `.claude/scripts/db_query.py` 的 `DB_CREDS` 中登记 `tp_mock`。
 
 ### 10.2 表结构
 
@@ -940,52 +950,54 @@ request.clientIp in cidrRange("10.0.0.0/24") || request.clientIp == "127.0.0.1"
 
 ```sql
 CREATE TABLE tb_mock_api (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
-    space_id BIGINT NOT NULL COMMENT '空间ID',
-    enterprise_id BIGINT NOT NULL COMMENT '企业ID',
-    api_info_id BIGINT DEFAULT NULL COMMENT '关联 tb_api_info.id（同库可加 FK，ON DELETE SET NULL）',
-    method VARCHAR(10) NOT NULL COMMENT 'HTTP 方法',
-    path VARCHAR(500) NOT NULL COMMENT '原始路径，支持 {var} 占位符；超长部分不参与唯一索引（见下方索引设计）',
-    enabled TINYINT DEFAULT 1 COMMENT '【接口级 mock 开关，v1.2 D8 第 2 层】1=ON，该接口的 mock 期望生效；0=OFF，匹配跳过该接口直接穿透',
-    default_scenario_id BIGINT DEFAULT NULL COMMENT '默认场景ID',
-    record_enabled TINYINT DEFAULT 0 COMMENT '是否录制中（P2）',
-    create_user_id BIGINT,
-    modify_user_id BIGINT,
-    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    deleted TINYINT DEFAULT 0,
-    -- ⚠️ utf8mb4 下 VARCHAR(500) 索引 = 2000 字节，超过 InnoDB 默认 768/3072 字节 prefix 限制；
-    --   建表前在 dev MariaDB 13307 dry-run 验证；落地方案二选一：
-    --   (1) path 改 VARCHAR(192)（utf8mb4 768 字节内）—— 简单直接，要约束业务路径长度
-    --   (2) 加冗余列 path_hash CHAR(32) GENERATED ALWAYS AS (MD5(path)) STORED，唯一索引建在 hash 上
-    UNIQUE INDEX uk_space_method_path (space_id, method, path, deleted),
-    INDEX idx_enterprise (enterprise_id, deleted),
-    INDEX idx_api_info (api_info_id, deleted)
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+    space_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '空间ID',
+    enterprise_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '企业ID',
+    api_info_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '关联 tb_api_info.id（属 tp_interface 库，跨库软关联、无外键）；0=未关联接口（游离 mock）',
+    method VARCHAR(10) NOT NULL DEFAULT '' COMMENT 'HTTP 方法',
+    path VARCHAR(192) NOT NULL DEFAULT '' COMMENT '原始路径，支持 {var} 占位符',
+    enabled TINYINT NOT NULL DEFAULT 1 COMMENT '接口级 mock 开关（v1.2 D8 第 2 层）：1-ON该接口期望生效 / 0-OFF匹配跳过直接穿透',
+    default_scenario_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '默认场景ID；0=无',
+    record_enabled TINYINT NOT NULL DEFAULT 0 COMMENT '是否录制中（P2）：0-否 / 1-是',
+    create_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '创建人ID',
+    modify_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '修改人ID',
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    modify_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    deleted TINYINT NOT NULL DEFAULT 0 COMMENT '逻辑删除：0-未删除 / 1-已删除',
+    -- path VARCHAR(192)：满足"VARCHAR<255"红线，utf8mb4 下唯一索引也在 InnoDB prefix 限制内（决策记录 #12=A）；
+    --   若实测业务路径超 192 字符、dry-run 不通过，按 #12=B fallback：加 path_hash CHAR(32) generated 列，唯一索引建在 hash 上
+    UNIQUE INDEX uk_space_method_path (space_id, method, path),
+    INDEX ix_enterprise (enterprise_id, deleted),
+    INDEX ix_api_info (api_info_id, deleted),
+    INDEX ix_modify_time (modify_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Mock 接口配置表';
 ```
 
 > **`path_pattern` 字段已移除**：原设计存"原始 path + Spring PathPattern 字符串"两份冗余；但 PathPattern 完全可由 path 推导（`PathPatternParser` 直接解析），存两份反而引入一致性风险。**只存 `path`，运行时缓存编译后的 `PathPattern` 对象**（启动时全量构建 + CRUD 后增量刷新）。
 
+> **唯一索引不含 `deleted`（修正 #5）**：`uk_space_method_path` 只锁 `(space_id, method, path)`。若把 `deleted` 一并放进唯一键，同一 path 被软删两次会产生两行 `deleted=1` → 撞唯一键、第二次软删失败（MyBatis-Plus 逻辑删除经典坑）。去掉 `deleted` 后一个 `(space, method, path)` 全表最多一行：`/mock-service/api/create-or-enable` 命中已软删行时**复活**它（`deleted=0` + 重置字段），而不是插新行。下方 `tb_mock_scenario.uk_space_code`、`tb_mock_response`/`tb_mock_chaos_rule` 的唯一键同理——逻辑删除字段一律不进唯一索引。
+
 #### 表 2：`tb_mock_scenario`（场景）
 
 ```sql
 CREATE TABLE tb_mock_scenario (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    space_id BIGINT NOT NULL,
-    enterprise_id BIGINT NOT NULL,
-    name VARCHAR(100) NOT NULL COMMENT '场景名称',
-    code VARCHAR(50) NOT NULL COMMENT '场景 code，客户端 Header 用',
-    description VARCHAR(500),
-    scope ENUM('SPACE','API') DEFAULT 'API' COMMENT 'SPACE=空间级（跨接口）, API=接口级',
-    api_id BIGINT DEFAULT NULL COMMENT 'scope=API 时关联的 tb_mock_api.id',
-    is_default TINYINT DEFAULT 0,
-    create_user_id BIGINT,
-    modify_user_id BIGINT,
-    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    deleted TINYINT DEFAULT 0,
-    UNIQUE INDEX uk_space_code (space_id, code, scope, api_id, deleted),
-    INDEX idx_api (api_id, deleted)
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+    space_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '空间ID',
+    enterprise_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '企业ID',
+    name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '场景名称',
+    code VARCHAR(50) NOT NULL DEFAULT '' COMMENT '场景 code，客户端 Header 用',
+    description VARCHAR(200) NOT NULL DEFAULT '' COMMENT '场景描述',
+    scope TINYINT NOT NULL DEFAULT 1 COMMENT '作用域：0-空间级(跨接口) / 1-接口级',
+    api_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'scope=接口级时关联的 tb_mock_api.id；0=空间级',
+    is_default TINYINT NOT NULL DEFAULT 0 COMMENT '是否默认场景：0-否 / 1-是',
+    create_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '创建人ID',
+    modify_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '修改人ID',
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    modify_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    deleted TINYINT NOT NULL DEFAULT 0 COMMENT '逻辑删除：0-未删除 / 1-已删除',
+    UNIQUE INDEX uk_space_code (space_id, code, scope, api_id),
+    INDEX ix_api (api_id, deleted),
+    INDEX ix_modify_time (modify_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Mock 场景表';
 ```
 
@@ -993,44 +1005,36 @@ CREATE TABLE tb_mock_scenario (
 
 ```sql
 CREATE TABLE tb_mock_expectation (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    space_id BIGINT NOT NULL COMMENT '冗余字段（与 tb_mock_api.space_id 一致），运行时缓存按 space_id 分桶，避免 join',
-    api_id BIGINT NOT NULL COMMENT '关联 tb_mock_api.id',
-    scenario_id BIGINT NOT NULL COMMENT '关联 tb_mock_scenario.id',
-    name VARCHAR(100) NOT NULL,
-    enabled TINYINT DEFAULT 1,
-    priority INT DEFAULT 0 COMMENT '优先级，数值越大越优先',
-    match_expression TEXT COMMENT 'CEL 匹配表达式',
-    match_form_json JSON COMMENT '工作台表单形式（用于回显，可与 match_expression 互转，互转边界见 §9.2）',
-
-    -- Stateful
-    stateful_key VARCHAR(200) DEFAULT NULL,
-    from_state VARCHAR(50) DEFAULT NULL,
-    to_state VARCHAR(50) DEFAULT NULL,
-
-    -- 单响应（多响应见 tb_mock_response）
-    response_type ENUM('STATIC','TEMPLATE','SCRIPT','FAKER','OPENAPI_EXAMPLE','MULTI') DEFAULT 'STATIC'
-        COMMENT '响应类型；MULTI 表示从 tb_mock_response 加权随机；MULTI 不可嵌套 MULTI（tb_mock_response.response_type 不含 MULTI）；不含 PROXY——v1.2 D10 后 PROXY 是"未命中自动穿透"的全局行为，由 X-Env-Id 决定 base_url，不作为 expectation 的可选项',
-    response_body MEDIUMTEXT,
-    response_headers JSON COMMENT '格式锁定为数组：[{"name":"X-Foo","value":"bar"}]；不接受对象形式 {"k":"v"}（避免历史 P14 的兼容问题）',
-    response_status_code INT DEFAULT 200,
-    content_type VARCHAR(100) DEFAULT 'application/json',
-    delay_ms INT DEFAULT 0,
-    script_type ENUM('JS','GROOVY','PYTHON','BEANSHELL') DEFAULT NULL
-        COMMENT '与 test-mng-api-test-execution 模块支持的脚本引擎对齐；P0 不实现，P1 起接 GraalJS / Groovy',
-
-    -- 录制
-    recorded_from VARCHAR(500) DEFAULT NULL COMMENT '录制来源 URL',
-    recorded_at TIMESTAMP DEFAULT NULL,
-
-    create_user_id BIGINT,
-    modify_user_id BIGINT,
-    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    deleted TINYINT DEFAULT 0,
-    INDEX idx_space_api (space_id, api_id, enabled, deleted),
-    INDEX idx_api_scenario (api_id, scenario_id, enabled, deleted),
-    INDEX idx_priority (api_id, priority DESC, deleted)
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+    space_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '空间ID（冗余字段，与 tb_mock_api.space_id 一致；运行时缓存按 space_id 分桶，避免 join）',
+    api_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '关联 tb_mock_api.id',
+    scenario_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '关联 tb_mock_scenario.id',
+    name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '期望名称',
+    enabled TINYINT NOT NULL DEFAULT 1 COMMENT '期望级 mock 开关（v1.2 D8 第 3 层）：1-ON / 0-OFF',
+    priority INT NOT NULL DEFAULT 0 COMMENT '优先级，数值越大越优先',
+    match_expression TEXT NOT NULL DEFAULT '' COMMENT 'CEL 匹配表达式',
+    match_form_json JSON NOT NULL DEFAULT '{}' COMMENT '工作台表单形式（用于回显，可与 match_expression 互转，互转边界见 §9.2）',
+    stateful_key VARCHAR(200) NOT NULL DEFAULT '' COMMENT '状态机 key（P2）；空串=非状态机期望',
+    from_state VARCHAR(50) NOT NULL DEFAULT '' COMMENT '状态机：起始状态（P2）',
+    to_state VARCHAR(50) NOT NULL DEFAULT '' COMMENT '状态机：流转后状态（P2）',
+    response_type TINYINT NOT NULL DEFAULT 0 COMMENT '响应类型：0-STATIC静态 / 1-TEMPLATE模板 / 2-SCRIPT脚本 / 3-FAKER / 4-OPENAPI_EXAMPLE / 5-MULTI多响应加权随机。MULTI 从 tb_mock_response 取且不可嵌套；不含 PROXY（v1.2 D10 后穿透是全局行为，由 X-Env-Id 决定 base_url）',
+    response_body MEDIUMTEXT NOT NULL DEFAULT '' COMMENT '响应体（单响应）',
+    response_headers JSON NOT NULL DEFAULT '[]' COMMENT '响应头，格式锁定为数组：[{"name":"X-Foo","value":"bar"}]，不接受对象形式',
+    response_status_code INT NOT NULL DEFAULT 200 COMMENT '响应状态码',
+    content_type VARCHAR(100) NOT NULL DEFAULT 'application/json' COMMENT '响应 Content-Type',
+    delay_ms INT NOT NULL DEFAULT 0 COMMENT '响应延迟（毫秒）',
+    script_type TINYINT NOT NULL DEFAULT 0 COMMENT '脚本类型（与 api-test-execution 引擎对齐）：0-无 / 1-JS / 2-GROOVY / 3-PYTHON / 4-BEANSHELL。P0 不实现，P1 起接 GraalJS / Groovy',
+    recorded_from VARCHAR(250) NOT NULL DEFAULT '' COMMENT '录制来源 URL（P2）',
+    recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '录制时间（P2）；非录制来源的期望该值无意义',
+    create_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '创建人ID',
+    modify_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '修改人ID',
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    modify_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    deleted TINYINT NOT NULL DEFAULT 0 COMMENT '逻辑删除：0-未删除 / 1-已删除',
+    INDEX ix_space_api (space_id, api_id, enabled, deleted),
+    INDEX ix_api_scenario (api_id, scenario_id, enabled, deleted),
+    INDEX ix_priority (api_id, priority DESC, deleted),
+    INDEX ix_modify_time (modify_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Mock 期望表';
 ```
 
@@ -1038,38 +1042,46 @@ CREATE TABLE tb_mock_expectation (
 
 ```sql
 CREATE TABLE tb_mock_response (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    expectation_id BIGINT NOT NULL,
-    weight INT DEFAULT 100 COMMENT '加权随机的权重',
-    response_type ENUM('STATIC','TEMPLATE','SCRIPT','FAKER') DEFAULT 'STATIC' COMMENT '不含 MULTI——MULTI 不可嵌套',
-    response_body MEDIUMTEXT,
-    response_headers JSON COMMENT '格式与 tb_mock_expectation.response_headers 保持一致：[{"name":"X-Foo","value":"bar"}]',
-    response_status_code INT DEFAULT 200,
-    content_type VARCHAR(100) DEFAULT 'application/json',
-    delay_ms INT DEFAULT 0,
-    sort_order INT DEFAULT 0,
-    INDEX idx_expectation (expectation_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Mock 多响应';
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+    expectation_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '关联 tb_mock_expectation.id',
+    weight INT NOT NULL DEFAULT 100 COMMENT '加权随机的权重',
+    response_type TINYINT NOT NULL DEFAULT 0 COMMENT '响应类型：0-STATIC / 1-TEMPLATE / 2-SCRIPT / 3-FAKER（不含 MULTI，MULTI 不可嵌套）',
+    response_body MEDIUMTEXT NOT NULL DEFAULT '' COMMENT '响应体',
+    response_headers JSON NOT NULL DEFAULT '[]' COMMENT '响应头，格式与 tb_mock_expectation.response_headers 一致：[{"name":"X-Foo","value":"bar"}]',
+    response_status_code INT NOT NULL DEFAULT 200 COMMENT '响应状态码',
+    content_type VARCHAR(100) NOT NULL DEFAULT 'application/json' COMMENT '响应 Content-Type',
+    delay_ms INT NOT NULL DEFAULT 0 COMMENT '响应延迟（毫秒）',
+    sort_order INT NOT NULL DEFAULT 0 COMMENT '排序序号',
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    modify_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    deleted TINYINT NOT NULL DEFAULT 0 COMMENT '逻辑删除：0-未删除 / 1-已删除',
+    INDEX ix_expectation (expectation_id, deleted),
+    INDEX ix_modify_time (modify_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Mock 多响应表';
 ```
 
-> 仅当 `tb_mock_expectation.response_type = 'MULTI'` 时生效。
+> 仅当 `tb_mock_expectation.response_type` 为 MULTI（TINYINT 值 5）时生效。
 
 #### 表 5：`tb_mock_chaos_rule`（Chaos 规则）
 
 ```sql
 CREATE TABLE tb_mock_chaos_rule (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    space_id BIGINT NOT NULL,
-    enterprise_id BIGINT NOT NULL,
-    name VARCHAR(100) NOT NULL,
-    target_type ENUM('GLOBAL','API','EXPECTATION') NOT NULL,
-    target_id BIGINT DEFAULT NULL,
-    chaos_type ENUM('LATENCY','ERROR_RATE','DROP_FIELD','RATE_LIMIT','CHUNKED_SLOW') NOT NULL,
-    config_json JSON NOT NULL COMMENT '具体参数，如 {"min":500,"max":2000} 或 {"rate":0.1,"status":500}',
-    enabled TINYINT DEFAULT 1,
-    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_target (target_type, target_id, enabled)
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+    space_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '空间ID',
+    enterprise_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '企业ID',
+    name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '规则名称',
+    target_type TINYINT NOT NULL DEFAULT 0 COMMENT '作用目标：0-GLOBAL全局 / 1-API接口 / 2-EXPECTATION期望',
+    target_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '目标 ID（target_type=API 时为 api id，=EXPECTATION 时为 expectation id）；0=全局',
+    chaos_type TINYINT NOT NULL DEFAULT 0 COMMENT '故障类型：0-LATENCY延迟 / 1-ERROR_RATE错误率 / 2-DROP_FIELD丢字段 / 3-RATE_LIMIT限流 / 4-CHUNKED_SLOW分块慢传',
+    config_json JSON NOT NULL DEFAULT '{}' COMMENT '具体参数，如 {"min":500,"max":2000} 或 {"rate":0.1,"status":500}',
+    enabled TINYINT NOT NULL DEFAULT 1 COMMENT '是否启用：0-禁用 / 1-启用',
+    create_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '创建人ID',
+    modify_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '修改人ID',
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    modify_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+    deleted TINYINT NOT NULL DEFAULT 0 COMMENT '逻辑删除：0-未删除 / 1-已删除',
+    INDEX ix_target (target_type, target_id, enabled, deleted),
+    INDEX ix_modify_time (modify_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Chaos 规则表';
 ```
 
@@ -1077,40 +1089,43 @@ CREATE TABLE tb_mock_chaos_rule (
 
 ```sql
 CREATE TABLE tb_mock_call_log (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    trace_id CHAR(32) NOT NULL,
-    space_id BIGINT NOT NULL,
-    enterprise_id BIGINT NOT NULL,
-    env_id BIGINT DEFAULT NULL COMMENT '环境ID（v1.2，从 X-Env-Id 取，穿透时必填）',
-    api_id BIGINT,
-    expectation_id BIGINT,
-    scenario_id BIGINT,
-    case_id BIGINT DEFAULT NULL COMMENT '若调用来自 case 执行（X-Mock-Source: case），记录 case_id 便于审计',
-    method VARCHAR(10),
-    path VARCHAR(500),
-    status_code INT,
-    cost_ms INT,
-    matched TINYINT COMMENT '1=mock 命中；0=未命中',
-    passthrough TINYINT DEFAULT 0 COMMENT 'v1.2：1=已穿透到真实后端（含成功/失败）；0=mock 命中或彻底失败未穿透',
-    miss_reason VARCHAR(64) DEFAULT NULL COMMENT '未命中原因：space_disabled / api_not_found / api_disabled / no_match / all_expectations_disabled / env_resolve_error / upstream_error',
-    upstream_url VARCHAR(1000) DEFAULT NULL COMMENT 'v1.2：穿透时实际转发的真实 URL（含 query），便于排查',
-    upstream_cost_ms INT DEFAULT NULL COMMENT 'v1.2：穿透时下游真实接口的耗时',
-    request_headers MEDIUMTEXT,
-    request_query MEDIUMTEXT,
-    request_body MEDIUMTEXT,
-    response_headers MEDIUMTEXT,
-    response_body MEDIUMTEXT,
-    chaos_applied VARCHAR(255) DEFAULT NULL,
-    client_ip VARCHAR(64),
-    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_trace (trace_id),
-    INDEX idx_space_time (space_id, create_time DESC),
-    INDEX idx_api_time (api_id, create_time DESC),
-    INDEX idx_passthrough (passthrough, create_time DESC)
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+    trace_id CHAR(32) NOT NULL DEFAULT '' COMMENT '链路追踪ID',
+    space_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '空间ID',
+    enterprise_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '企业ID',
+    env_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '环境ID（v1.2，从 X-Env-Id 取，穿透时必填）；0=无',
+    api_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '命中的 Mock 接口ID；0=未命中接口',
+    expectation_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '命中的期望ID；0=未命中期望',
+    scenario_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '命中的场景ID；0=无',
+    case_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '若调用来自 case 执行（X-Mock-Source: case）记录 case_id 便于审计；0=非 case 来源',
+    method VARCHAR(10) NOT NULL DEFAULT '' COMMENT 'HTTP 方法',
+    path VARCHAR(250) NOT NULL DEFAULT '' COMMENT '请求路径',
+    status_code INT NOT NULL DEFAULT 0 COMMENT '响应状态码',
+    cost_ms INT NOT NULL DEFAULT 0 COMMENT '总耗时（毫秒）',
+    matched TINYINT NOT NULL DEFAULT 0 COMMENT '是否命中 mock：1-命中 / 0-未命中',
+    passthrough TINYINT NOT NULL DEFAULT 0 COMMENT 'v1.2：1-已穿透到真实后端（含成功/失败）/ 0-mock 命中或彻底失败未穿透',
+    miss_reason VARCHAR(64) NOT NULL DEFAULT '' COMMENT '未命中原因（对应 MissReason 枚举）：space_disabled / api_not_found / api_disabled / no_match / all_expectations_disabled / env_resolve_error / env_no_route / upstream_error',
+    upstream_url VARCHAR(250) NOT NULL DEFAULT '' COMMENT 'v1.2：穿透时实际转发的真实 URL；过长截断，完整 query 见 request_query',
+    upstream_cost_ms INT NOT NULL DEFAULT 0 COMMENT 'v1.2：穿透时下游真实接口的耗时（毫秒）',
+    request_headers MEDIUMTEXT NOT NULL DEFAULT '' COMMENT '请求头',
+    request_query MEDIUMTEXT NOT NULL DEFAULT '' COMMENT '请求 query',
+    request_body MEDIUMTEXT NOT NULL DEFAULT '' COMMENT '请求体',
+    response_headers MEDIUMTEXT NOT NULL DEFAULT '' COMMENT '响应头',
+    response_body MEDIUMTEXT NOT NULL DEFAULT '' COMMENT '响应体',
+    chaos_applied VARCHAR(250) NOT NULL DEFAULT '' COMMENT '已应用的 Chaos 规则（逗号分隔）',
+    client_ip VARCHAR(64) NOT NULL DEFAULT '' COMMENT '客户端 IP',
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    modify_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间（日志表只插不改，恒等于 create_time）',
+    INDEX ix_trace (trace_id),
+    INDEX ix_space_time (space_id, create_time DESC),
+    INDEX ix_api_time (api_id, create_time DESC),
+    INDEX ix_passthrough (passthrough, create_time DESC),
+    INDEX ix_modify_time (modify_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Mock 调用日志（含穿透）';
 ```
 
 > **保留期 7 天**，由独立定时任务按 `create_time` 清理；如 body 体积大，超阈值（如 1MB）截断并打标。
+> 该表是高频写入的审计日志，按 TTL 物理清理、**不设 `deleted` 逻辑删除字段**——团队红线"禁止物理 DELETE / 建议逻辑删除"的合理例外；其余业务实体表仍一律逻辑删除。
 > 写入侧统一走 `MockCallLogRepository`，方便后续切到 ClickHouse / Kafka 时不动业务代码。
 
 ### 10.3 ER 图
@@ -1133,14 +1148,14 @@ tb_mock_call_log       → 关联 api/expectation，但运行时不强约束
 
 ### 10.4 与现有 `tb_api_*` / `tb_space` 表的关系
 
-> v1.1 库归属决策改为"复用 `tp_interface`"后，`tb_mock_*` 与 `tb_api_*` **同库共存**，可以加外键约束、可以 join。
+> v1.3 库归属决策改为**独立库 `tp_mock`** 后，`tb_mock_*` 与 `tb_api_*` / `tb_space` **跨库分离**，不能加外键、不能 join——所有跨域引用均为**应用层软关联**（仅存 ID，按需 RPC 查询或分别查询后内存合并）。
 > v1.2 D8 三级开关结构 + D9 case 引用接口期望，需要在现有表上**加 2 个字段**。
 
 | 方向 | 关系 |
 |---|---|
-| `tb_mock_api.api_info_id` → `tb_api_info.id` | **同库可加外键** `FK_mock_api__api_info` ON DELETE SET NULL；便于"从接口详情跳到 Mock 配置" / 跨表 join 列表查询 |
+| `tb_mock_api.api_info_id` → `tb_api_info.id` | **跨库软关联**（仅存 ID、无外键）：`tb_mock_api` 属 `tp_mock`、`tb_api_info` 属 `tp_interface`。"从接口详情跳 Mock 配置"靠 `api_info_id` 等值查询；列表页需接口名等字段时由 mock-service 调 api-test InnerClient 批量拉取后内存拼装，不做跨库 join |
 | 接口创建时 → **延迟创建 mock_api** | 接口创建**不预创建** `tb_mock_api`；用户**第一次在接口详情页开启 Mock 开关**时 mock-service 才落库 |
-| 接口删除时 | 利用外键 `ON DELETE SET NULL`：`tb_api_info` 删除后 `tb_mock_api.api_info_id` 自动置空（成为"游离 mock"，用户可手动删除或重新关联） |
+| 接口删除时 | 跨库无外键级联：api-test 删除 `tb_api_info` 后不会自动清理 `tb_mock_api.api_info_id`。mock-service 运行时按 `api_info_id` 解析不到接口即视为"游离 mock"（用户可手动删除或重新关联）；P1 可由 api-test 删接口时发事件通知 mock-service 主动清理 |
 | **`tb_space.enable_mock`**（新增字段）| **D8 第 1 层开关**：space 总开关，OFF 时该 space 下所有 mock 都不生效（即使带 X-Mock-Enabled 也直接穿透）；属于 `tp_system` / system 模块 |
 | **`tb_api_case.enable_mock`**（新增字段，api-test 模块）| **D9 落地**：case 上的开关，ON 时执行引擎给请求加 `X-Mock-Enabled` Header；OFF 时 case 直接打真实接口；不影响接口期望本身 |
 
@@ -1153,7 +1168,7 @@ tb_mock_call_log       → 关联 api/expectation，但运行时不强约束
 -- 路径：test-mng-system/src/main/resources/db/migration/V<date>__add_enable_mock_to_space.sql
 ALTER TABLE tb_space
     ADD COLUMN enable_mock TINYINT NOT NULL DEFAULT 0
-    COMMENT 'space 级 Mock 总开关（v1.2 D8 第 1 层）：0=OFF / 1=ON' AFTER <某字段>;
+    COMMENT 'space 级 Mock 总开关（v1.2 D8 第 1 层）：0=OFF / 1=ON';
 ```
 
 ```sql
@@ -1161,10 +1176,10 @@ ALTER TABLE tb_space
 -- 路径：test-mng-api-test/src/main/resources/db/migration/V<date>__add_enable_mock_to_api_case.sql
 ALTER TABLE tb_api_case
     ADD COLUMN enable_mock TINYINT NOT NULL DEFAULT 0
-    COMMENT 'case 执行时是否走 mock（v1.2 D9）：0=OFF（直接打真实）/ 1=ON（执行引擎给请求加 X-Mock-Enabled Header）' AFTER <某字段>;
+    COMMENT 'case 执行时是否走 mock（v1.2 D9）：0=OFF（直接打真实）/ 1=ON（执行引擎给请求加 X-Mock-Enabled Header）';
 ```
 
-⚠️ **DDL 落地前**用 query-db skill 确认 `tb_space` / `tb_api_case` 当前列结构再决定 `AFTER <某字段>` 放哪。
+⚠️ 新增字段一律**追加到表末尾**——团队红线禁止 `AFTER` / `BEFORE`（也禁止改字段顺序）。DDL 落地前仍用 query-db skill 在 dev MariaDB 13307 dry-run 验证。
 
 #### 10.4.2 跨模块责任划分
 
@@ -1183,7 +1198,7 @@ ALTER TABLE tb_api_case
 ```
 [Mock 服务实例 N]                       [Redis]                   [MySQL]
 ┌──────────────────┐    miss          ┌──────────────────┐  miss  ┌──────────────┐
-│ 本地 Caffeine    │ ───────────────▶ │ Redis Hash       │ ─────▶ │ tp_interface │
+│ 本地 Caffeine    │ ───────────────▶ │ Redis Hash       │ ─────▶ │ tp_mock      │
 │ - 全量规则索引   │                  │ - 热点期望        │        │ tb_mock_*    │
 │ - PathPattern 树 │                  │ - 状态机          │        │              │
 │ - 期望详情(LRU)  │                  │ - Chaos 规则      │        │              │
@@ -1217,8 +1232,8 @@ mock-service 启动时一次性查 `tb_mock_api` + `tb_mock_expectation`（按 `
 **对账兜底**：Redis pub/sub **不保证投递**——订阅者宕机/网络抖动期间消息丢失，新启动实例订阅前发布的消息也收不到。每个 mock-service 实例额外开**每 60s 全量对账任务**：
 
 ```
-SELECT MAX(update_time) FROM tb_mock_api WHERE deleted=0;
-SELECT MAX(update_time) FROM tb_mock_expectation WHERE deleted=0;
+SELECT MAX(modify_time) FROM tb_mock_api WHERE deleted=0;
+SELECT MAX(modify_time) FROM tb_mock_expectation WHERE deleted=0;
 ```
 
 与本地 Caffeine 记录的 `lastSyncTime` 比对，发现新增量再增量加载；保证 pub/sub 失效时**最迟 60s** 配置仍能生效。
@@ -1247,6 +1262,7 @@ MySQL: tb_mock_call_log（DDL 见 §10.2 表 6）
 ```
 
 关键点：
+- **入队前先快照**（修正 #6）：必须在请求线程内同步把 method / path / headers / query / body / 命中信息抽成 `MockCallLog` 实体再 `offer` 入队；**不能把 `HttpServletRequest` 引用塞进队列**——响应结束后容器会回收 request 对象，异步 flush 线程再读会拿到脏数据 / 抛 `IllegalStateException`；body 也已被 match 阶段消费，须从 `CachedBodyHttpServletRequest` 取（见 §17.3 修正 #1）
 - **有界队列** + 拒绝策略 `discardOldest`：日志洪峰时优先丢老日志，保业务不被反压
 - **应用 graceful shutdown** 时 drain 队列再退出
 - **降级开关**：`mock.audit.enabled=false` 时全链路跳过日志，故障时一键关
@@ -1296,10 +1312,11 @@ mock-service 暴露 Prometheus 指标：
 | 类别 | 阶段 | 路径 | 方法 | 说明 |
 |---|---|---|---|---|
 | **MockApi**（接口层）| P0 | `/mock-service/api/by-api-info` | POST | 根据 `apiInfoId` 查 mock 主表（接口 Mock Tab 进来时调用；不存在返回空） |
-| | P0 | `/mock-service/api/create-or-enable` | POST | 第一次开 Mock 开关时**延迟创建** mock_api 主表（D9 配套）|
+| | P0 | `/mock-service/api/create-or-enable` | POST | 第一次开 Mock 开关时**延迟创建** mock_api 主表（D9 配套）；若该 (space,method,path) 已有软删行则**复活**而非插新行（见 §10.2 表 1 注，修正 #5）|
 | | P0 | `/mock-service/api/toggle` | POST | 接口级 mock 开关（写 `tb_mock_api.enabled`）|
 | | P0 | `/mock-service/api/{id}` | GET | 详情 |
 | | P0 | `/mock-service/api/delete` | POST | 软删（用户主动清除该接口的 mock 配置）|
+| | P0 | `/mock-service/api/list-enabled-paths` | POST | 列出该 space 下所有"已开 mock 开关"的 (method, path)，供前端 axios 拦截器判断是否加 `X-Mock-Enabled`（§14.5 依赖，修正 #15）|
 | | P2 | `/mock-service/api/from-openapi` | POST | 从 OpenAPI 一键导入期望 |
 | **Expectation**（期望）| P0 | `/mock-service/expectation/list-by-api` | POST | 列出某接口下所有期望（接口 Mock Tab 主体内容）|
 | | P0 | `/mock-service/expectation/create` | POST | 新建 |
@@ -1650,13 +1667,14 @@ src/api/modules/mock/
 
 **P0 前置（编码前必须完成）**
 - [x] ✅ §0 D1-D11 决策已全部确认
+- [ ] **申请独立库 `tp_mock`** + 账号 / 密码（库名 = 用户名 = `tp_mock`）；在 `.claude/scripts/db_query.py` 的 `DB_CREDS` 中登记 `tp_mock`；dev Nacos 新增 datasource 配置
 - [ ] **DDL dry-run**：在 dev MariaDB 13307 验证 `tb_mock_api` 的 `(space_id, method, path)` 唯一索引；现状路径都不长就走 `path VARCHAR(192)`，否则 `path_hash CHAR(32)`
 - [ ] `tb_space.enable_mock` 字段添加（**system 模块** migration，见 §10.4.1）
 - [ ] `tb_api_case.enable_mock` 字段添加（**api-test 模块** migration，见 §10.4.1）
 - [ ] **api-test 模块** 暴露 `EnvironmentResolveService` + `ApiTestInnerClient`（resolve-base-url 接口，§13.4.1）—— 复用现有 case 执行引擎里"按环境解析 URL"的逻辑
 
 **P0（MVP）** — 第一版可用
-- [ ] 新建 `test-mng-mock` Maven 模块（库直接复用 `tp_interface`，无需申请新库；datasource / Redis 配置参考 §17.5 Nacos 配置清单）
+- [ ] 新建 `test-mng-mock` Maven 模块（连独立库 `tp_mock`，需先完成上方 P0 前置的建库；datasource / Redis 配置参考 §17.5 Nacos 配置清单）
 - [ ] **6 张表全建**（即使 P0 只用 3 张），避免 P1/P2 反复迁移；P0 不开放的功能在管理 API 层屏蔽
 - [ ] Entity + Mapper + 基础 CRUD（管理面），Controller 用 `JsonDataVO<T>` / `PageDataVO<T>`，业务异常抛 `BizException` + `BizCodeEnum`
 - [ ] `MockRoutingFilter`（Header 触发；**含 `/mock-service/` 与 `/__mock/` 前缀守卫**，避免循环改写）
@@ -1740,7 +1758,7 @@ src/api/modules/mock/
 | 响应 Header | 说明 |
 |---|---|
 | `X-Mock-Hit` | `expectation:<id>` / `passthrough` / `passthrough_failed` / `passthrough_no_route` |
-| `X-Mock-Passthrough-Reason` | 仅 `X-Mock-Hit` 含 `passthrough` 时返回：`space_disabled` / `api_not_found` / `api_disabled` / `no_match` / `all_expectations_disabled` / `env_resolve_error` / `upstream_error` |
+| `X-Mock-Passthrough-Reason` | 仅 `X-Mock-Hit` 含 `passthrough` 时返回（对应 `MissReason` 枚举）：`space_disabled` / `api_not_found` / `api_disabled` / `no_match` / `all_expectations_disabled` / `env_resolve_error` / `env_no_route` / `upstream_error` |
 | `X-Mock-Cost-Ms` | mock-service 内部处理耗时（不含穿透下游耗时）|
 | `X-Mock-Upstream-Cost-Ms` | 仅穿透时返回：下游真实接口的耗时 |
 
@@ -1773,6 +1791,82 @@ src/api/modules/mock/
 
 > **注**：v1.1 D3=A 已确认走 servlet stack，下方 `Mono<MatchedExpectation>` / `ServerWebExchange` 落地时替换为同步 `MatchedExpectation` + `HttpServletRequest`；`Schedulers.boundedElastic()` 直接去掉，普通 `@Service` 方法即可。骨架仅作流程参考。
 
+**请求体可重复读包装（修正 #1）** —— Servlet 的 `getInputStream()` 只能读一次；而 match 阶段要读 body 喂 CEL / 模板、passthrough 阶段又要读 body 转发真实后端，第二次会读到空。入口 Filter 先把 body 全量缓存成 `byte[]`：
+
+```java
+// 把 body 一次性读进 byte[]，getInputStream() 每次基于它新开流
+public class CachedBodyHttpServletRequest extends HttpServletRequestWrapper {
+    private final byte[] cachedBody;
+
+    public CachedBodyHttpServletRequest(HttpServletRequest request) throws IOException {
+        super(request);
+        this.cachedBody = StreamUtils.copyToByteArray(request.getInputStream());
+    }
+
+    public byte[] getCachedBody() { return cachedBody; }
+
+    @Override
+    public ServletInputStream getInputStream() {
+        // CachedBodyServletInputStream：基于 ByteArrayInputStream 的 ServletInputStream 实现（略）
+        return new CachedBodyServletInputStream(cachedBody);
+    }
+
+    @Override
+    public BufferedReader getReader() {
+        return new BufferedReader(new InputStreamReader(
+                new ByteArrayInputStream(cachedBody), StandardCharsets.UTF_8));
+    }
+}
+
+// 最高优先级 Filter，只包数据面 /__mock 请求
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class MockBodyCachingFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse resp, FilterChain chain)
+            throws ServletException, IOException {
+        if (req.getRequestURI().startsWith("/__mock")) {
+            chain.doFilter(new CachedBodyHttpServletRequest(req), resp);
+        } else {
+            chain.doFilter(req, resp);   // 管理面 /api 等不需要重复读
+        }
+    }
+}
+```
+
+> ⚠️ 不要用 Spring 自带的 `ContentCachingRequestWrapper`：它只在应用读过 body 之后才缓存、且不会重新供流，满足不了"先全量缓存、可无限次重读"。
+
+**`PassthroughException` / `PassthroughContext`（修正 #2 + #3）** —— 穿透异常必须携带 `path`（否则 `MockProxyService` 拼不出 targetUrl），并把"mock_api 主键"与"api_info.id"分开存：前者落日志、后者按目录解析环境，**不可混用**。
+
+```java
+@Getter @Builder
+public class PassthroughContext {
+    private final Long envId;
+    private final Long spaceId;
+    private final String path;        // 已 strip /__mock，passthrough 拼 targetUrl 用
+    private final String method;
+    @Setter private Long mockApiId;   // tb_mock_api.id —— 落调用日志用
+    @Setter private Long apiInfoId;   // tb_api_info.id —— 穿透按目录解析环境用
+}
+
+@Getter
+public class PassthroughException extends RuntimeException {
+    private final MissReason reason;
+    private final PassthroughContext ctx;
+
+    public PassthroughException(MissReason reason, PassthroughContext ctx) {
+        this.reason = reason;
+        this.ctx = ctx;
+    }
+    // 便捷委托，供 MockProxyService 直接取
+    public Long getEnvId()     { return ctx.getEnvId(); }
+    public Long getSpaceId()   { return ctx.getSpaceId(); }
+    public String getPath()    { return ctx.getPath(); }
+    public Long getApiInfoId() { return ctx.getApiInfoId(); }
+    public Long getMockApiId() { return ctx.getMockApiId(); }
+}
+```
+
 `MockMatchService.java` 主流程（**v1.2 加入三级开关检查 + 抛 PassthroughException 触发穿透**）：
 
 ```java
@@ -1787,50 +1881,77 @@ public class MockMatchService {
 
     public MatchedExpectation match(HttpServletRequest request) {
         // ===== Header 解析（v1.2 D4 + D5 + D11）=====
-        Long spaceId = parseLongHeader(request, "X-Space-Id");  // 缺失返回 400
-        Long envId   = parseLongHeader(request, "X-Env-Id");    // 缺失返回 400
+        // parseLongHeader：缺失 / 非数字 → 抛 BizException(400)，交全局 @RestControllerAdvice 处理
+        Long spaceId = parseLongHeader(request, "X-Space-Id");
+        Long envId   = parseLongHeader(request, "X-Env-Id");
         String method = request.getMethod();
         String fullPath = request.getRequestURI();
         String path = fullPath.startsWith("/__mock") ? fullPath.substring("/__mock".length()) : fullPath;
 
+        // 穿透上下文：envId/spaceId/path/method 一开始就备齐，任何一层未命中抛异常都带上它（修正 #2）
+        PassthroughContext pctx = PassthroughContext.builder()
+                .envId(envId).spaceId(spaceId).path(path).method(method).build();
+
         // ===== 三级开关检查（v1.2 D8）=====
-        // 第 1 层：space 总开关
-        if (!systemClient.isSpaceMockEnabled(spaceId)) {
-            throw new PassthroughException(MissReason.SPACE_DISABLED, envId, spaceId);
+        if (!systemClient.isSpaceMockEnabled(spaceId)) {                 // 第 1 层：space 总开关
+            throw new PassthroughException(MissReason.SPACE_DISABLED, pctx);
         }
-        // 第 2 层：接口级开关
-        List<MockApi> apis = cache.lookup(spaceId, method, path);
-        if (apis.isEmpty()) {
-            throw new PassthroughException(MissReason.API_NOT_FOUND, envId, spaceId);
-        }
-        MockApi api = apis.get(0);
+        // 第 2 层：接口级开关。cache.lookup 内部已按"静态段优先于 {var} 段"取唯一最佳匹配（修正 #10）
+        MockApi api = cache.lookup(spaceId, method, path)
+                .orElseThrow(() -> new PassthroughException(MissReason.API_NOT_FOUND, pctx));
+        pctx.setMockApiId(api.getId());            // 落日志用
+        pctx.setApiInfoId(api.getApiInfoId());     // 穿透解析环境用（修正 #3：不是 api.getId()）
         if (!api.getEnabled()) {
-            throw new PassthroughException(MissReason.API_DISABLED, envId, spaceId, api.getId());
+            throw new PassthroughException(MissReason.API_DISABLED, pctx);
         }
 
         // ===== 期望匹配 =====
-        String scenarioCode = headerOr(request, "X-Mock-Scenario", "default");
-        String forcedExpectation = request.getHeader("X-Mock-Expectation");
+        MockRequestContext ctx = MockRequestContext.from(request, path, api);
 
-        List<MockExpectation> expectations = cache.expectationsOf(apis, scenarioCode);
-        // 第 3 层：所有期望都禁用？
+        // 强指定旁路（X-Mock-Expectation，调试用）—— 修正 #4：必须校验租户 / 接口归属
+        String forced = request.getHeader("X-Mock-Expectation");
+        if (forced != null && !forced.isBlank()) {
+            MockExpectation exp = cache.expectationById(parseLongOrNull(forced));
+            if (exp == null || exp.getDeleted() == 1) {
+                throw new PassthroughException(MissReason.NO_MATCH, pctx);   // 指定期望不存在 → 穿透
+            }
+            if (!exp.getSpaceId().equals(spaceId) || !exp.getApiId().equals(api.getId())) {
+                // 禁止借 X-Mock-Expectation 跨 space / 跨接口读他人期望
+                throw new BizException(BizCodeEnum.MOCK_EXPECTATION_FORBIDDEN /* 新增 mock 专用业务码 */,
+                        "X-Mock-Expectation 不属于当前 space / 接口");
+            }
+            return new MatchedExpectation(exp, ctx);
+        }
+
+        // 场景过滤：scenarioCode=null 表示用接口默认场景（P0 恒为 null）
+        String scenarioCode = headerOr(request, "X-Mock-Scenario", null);
+        List<MockExpectation> expectations = cache.expectationsOf(api, scenarioCode);
+        // 第 3 层：场景内所有期望都禁用（含一条都没有）
         if (expectations.stream().noneMatch(MockExpectation::getEnabled)) {
-            throw new PassthroughException(MissReason.ALL_EXPECTATIONS_DISABLED, envId, spaceId, api.getId());
-        }
-        if (forcedExpectation != null) {
-            return new MatchedExpectation(cache.expectationById(Long.parseLong(forcedExpectation)),
-                    MockRequestContext.from(request, path, apis));
+            throw new PassthroughException(MissReason.ALL_EXPECTATIONS_DISABLED, pctx);
         }
 
-        // CEL 求值
-        MockRequestContext ctx = MockRequestContext.from(request, path, apis);
+        MatchedExpectation hit = matchInScenario(expectations, ctx);
+        if (hit == null && scenarioCode != null) {
+            // 修正 #9：指定场景没命中 → 回落默认场景再试一轮（P1；与 §3 流程 C 对齐）
+            hit = matchInScenario(cache.expectationsOf(api, null), ctx);
+        }
+        if (hit != null) {
+            return hit;
+        }
+        throw new PassthroughException(MissReason.NO_MATCH, pctx);
+    }
+
+    /** 按 priority 顺序求值一组期望，返回首个命中；无命中返回 null */
+    private MatchedExpectation matchInScenario(List<MockExpectation> expectations, MockRequestContext ctx) {
         for (MockExpectation exp : expectations) {
             if (!exp.getEnabled()) continue;
-            if (!cel.evaluate(exp.getMatchExpression(), ctx)) continue;
+            // 修正 #11：CEL 求值对"字段缺失 / body 非 JSON / body 为空"一律按"不匹配"处理，不抛错、不 500
+            if (!cel.evaluateSafe(exp.getMatchExpression(), ctx)) continue;
             if (!stateMachine.checkAndTransfer(exp, ctx)) continue;
             return new MatchedExpectation(exp, ctx);
         }
-        throw new PassthroughException(MissReason.NO_MATCH, envId, spaceId, api.getId());
+        return null;
     }
 }
 ```
@@ -1864,7 +1985,7 @@ public class MockProxyService {
         }
         EnvBaseUrlResolveVO env = resp.getData();
         if (env.getBaseUrl() == null) {
-            return errorResponse(404, "passthrough_no_route", "no_env_match");
+            return errorResponse(404, "passthrough_no_route", "env_no_route");
         }
 
         // 2. 重组请求转发
@@ -1878,7 +1999,9 @@ public class MockProxyService {
             ResponseEntity<byte[]> upstream = webClient.method(HttpMethod.valueOf(request.getMethod()))
                     .uri(targetUrl)
                     .headers(h -> h.addAll(headers))
-                    .body(BodyInserters.fromValue(request.getInputStream().readAllBytes()))
+                    // request 已被 MockBodyCachingFilter 包成可重复读（修正 #1）：
+                    //   match 阶段读过一次喂 CEL，这里再读转发不会读到空
+                    .body(BodyInserters.fromValue(StreamUtils.copyToByteArray(request.getInputStream())))
                     .retrieve()
                     .toEntity(byte[].class)
                     .timeout(Duration.ofMillis(env.getResponseTimeoutMs()))
@@ -1943,6 +2066,10 @@ public class MockRuntimeController {
 }
 ```
 
+> **修正 #6——日志入队前必须快照**：`callLogger.logHit / logPassthrough` 内部必须在**当前请求线程内同步**把 method / path / headers / query / body（从上面的 `CachedBodyHttpServletRequest` 取）/ 命中信息抽成 `MockCallLog` 实体，再 `offer` 进队列；**绝不能把 `HttpServletRequest` 引用带进异步队列**——响应结束后 servlet 容器会回收 request 对象，flush 线程再读会拿到脏数据 / 抛 `IllegalStateException`。
+>
+> 缺 `X-Space-Id` / `X-Env-Id`、`X-Mock-Expectation` 跨租户等参数类异常由 `match()` 抛 `BizException`，走全局 `@RestControllerAdvice`，不在本控制器 `try/catch` 内。
+
 ### 17.4 联调与测试用例骨架
 
 **P0 必备单测**：
@@ -1992,7 +2119,7 @@ public class MockRuntimeController {
 #### 17.5.1 `mock-service-dev.properties`（**新建**，dev Nacos）
 
 > 端口 **18011**（参考：`api-test-execution-service` 用 18006；如冲突自行调整）。
-> datasource / Redis 直接复用 `tp_interface` 与现有 dev Redis；密码已是公开 dev 信息（参见项目根 CLAUDE.md）。
+> datasource 连**独立库 `tp_mock`**（需先按 §15 P0 前置申请建库）；Redis 复用现有 dev 实例。`tp_mock` 库的密码由 DBA 分配后回填本清单与 Nacos，并同步登记到项目根 CLAUDE.md 的数据库清单。
 > 模板项以现有 `api-test-service-dev.properties` 为准（个别 key 可能有版本差异）；本清单覆盖 mock-service 必需的所有项。
 
 ```properties
@@ -2000,11 +2127,11 @@ public class MockRuntimeController {
 server.port=18011
 spring.application.name=mock-service
 
-# ===== 数据源（复用 tp_interface 库，与 api-test-service / api-test-execution-service 一致）=====
+# ===== 数据源（独立库 tp_mock，mock-service 专用；库名 = 用户名 = tp_mock）=====
 spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
-spring.datasource.url=jdbc:mysql://dev-mariadb.imchenr1024.com:13307/tp_interface?autoReconnect=false&useUnicode=true&characterEncoding=UTF-8&characterSetResults=UTF-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true
-spring.datasource.username=tp_interface
-spring.datasource.password=arGtWAWcRsGJbZAb
+spring.datasource.url=jdbc:mysql://dev-mariadb.imchenr1024.com:13307/tp_mock?autoReconnect=false&useUnicode=true&characterEncoding=UTF-8&characterSetResults=UTF-8&zeroDateTimeBehavior=convertToNull&useSSL=false&allowPublicKeyRetrieval=true
+spring.datasource.username=tp_mock
+spring.datasource.password=<待 DBA 创建 tp_mock 库后分配，回填此处与 CLAUDE.md>
 spring.datasource.hikari.maximum-pool-size=20
 spring.datasource.hikari.minimum-idle=5
 spring.datasource.hikari.connection-timeout=30000
@@ -2019,7 +2146,8 @@ spring.data.redis.lettuce.pool.max-idle=8
 
 # ===== MyBatis Plus =====
 mybatis-plus.mapper-locations=classpath*:mapper/xml/*.xml
-mybatis-plus.global-config.db-config.id-type=AUTO
+# 主键策略：雪花 ID（团队红线——DDL 列用 BIGINT UNSIGNED AUTO_INCREMENT 兜底，应用侧由 MyBatis-Plus 雪花生成）
+mybatis-plus.global-config.db-config.id-type=ASSIGN_ID
 mybatis-plus.global-config.db-config.logic-delete-field=deleted
 mybatis-plus.global-config.db-config.logic-not-delete-value=0
 mybatis-plus.global-config.db-config.logic-delete-value=1
@@ -2135,7 +2263,7 @@ spring.cloud.openfeign.client.config.default.read-timeout=20000
 ```bash
 # 1. dev Nacos 控制台：新建 mock-service-dev.properties + 改 gateway-service-dev.properties
 # 2. parent pom 加 modules、加 cel-core / pebble / caffeine 依赖
-# 3. 在 tp_interface 库执行 sql/mock/mysql/20260507_init.sql 建 6 张表（先 dry-run）
+# 3. 在独立库 tp_mock（须已按 §15 P0 前置申请创建）执行 sql/mock/mysql/20260507_init.sql 建 6 张表（先 dry-run）
 # 4. ./script/start_test_mng_backend.sh   ← 启动脚本会自动带上 mock-service
 # 5. 验证：
 curl -i http://localhost:<gateway-port>/mock-service/api/by-api-info \
@@ -2175,21 +2303,21 @@ curl -i .../api/login -H "X-Mock-Enabled: true" -H "X-Space-Id: 1"
 
 ---
 
-**文档版本**：v1.2
-**最后更新**：2026-05-07
+**文档版本**：v1.4
+**最后更新**：2026-05-21
 **作者**：qianwenbo（牵头），团队待补
-**状态**：✅ 决策已对齐（D1-D11 + 架构 15 项）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
-**P0 前置任务**：parent pom 加依赖 / DDL dry-run / 前端 axios 加 `X-Space-Id` 和 `X-Env-Id` / `tb_space.enable_mock` 与 `tb_api_case.enable_mock` 字段 / api-test 暴露 `EnvironmentResolveService` InnerClient / Nacos 配置见 §17.5
+**状态**：✅ 决策已对齐（D1-D11 + 架构 15 项）。v1.4 关键变更：代码评审修正 16 项——请求体可重复读包装（#1）、穿透异常补 `path` 并区分 mockApiId/apiInfoId（#2/#3）、`X-Mock-Expectation` 租户校验（#4）、逻辑删除字段移出唯一索引（#5）、调用日志入队前快照（#6）、§6.1 过时骨架标注（#7）、熔断兜底单一化（#8）、场景回落默认（#9）、`lookup` 取唯一接口（#10）、CEL 缺失字段语义（#11）、`miss_reason` 枚举统一（#12）、及 4 项文档过时小修（#13–16），逐条见正文"修正 #N"标注。v1.3 关键变更：① 库归属由"复用 `tp_interface`"反转为**独立库 `tp_mock`**（决策记录 #1 改判为 A，详见 §10.1）；② §10.2 六张表 DDL 全面对齐团队数据库红线（DATETIME 替代 TIMESTAMP、`modify_time` + `ix_modify_time` 索引、`BIGINT UNSIGNED` 主键、全字段 NOT NULL + 默认值、`TINYINT` 替代 ENUM、索引 `ix_` 前缀、ALTER 去 `AFTER`）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
+**P0 前置任务**：申请独立库 `tp_mock` + 凭据 / parent pom 加依赖 / DDL dry-run / 前端 axios 加 `X-Space-Id` 和 `X-Env-Id` / `tb_space.enable_mock` 与 `tb_api_case.enable_mock` 字段 / api-test 暴露 `EnvironmentResolveService` InnerClient / Nacos 配置见 §17.5
 
 ---
 
 ## 决策记录
 
-> 阻塞级决策见 §0（D1-D6）。本节记录架构层面其它决策项的最终结论，全部于 v1.1 确认。
+> 阻塞级决策见 §0（D1-D6）。本节记录架构层面其它决策项的最终结论，除特别注明外均于 v1.1 确认（#1 库归属已于 v1.3 修订为独立库 `tp_mock`）。
 
 | # | 决策项 | 选项 | 决策 ✅ |
 |---|---|---|---|
-| 1 | 库归属 | A) 独立库 `tp_mock` / B) 复用 `tp_interface`（与 api-test-execution 模式一致，表前缀 `tb_mock_*` 命名隔离） | **B** ✅（v1.1 修订）|
+| 1 | 库归属 | A) 独立库 `tp_mock` / B) 复用 `tp_interface`（与 api-test-execution 模式一致，表前缀 `tb_mock_*` 命名隔离） | **A** ✅（v1.3 修订）：v1.1 曾定为 B，v1.3 反转为 A——彻底的微服务边界 + 故障域 / 写入压力隔离 + 独立 SLA；跨库不能 join / 外键本就符合团队数据库红线。详见 §10.1 |
 | 2 | 表达式引擎 | A) CEL（`cel-core`）/ B) JsonLogic / C) 现有 13 个枚举操作符 | **A** |
 | 3 | 模板引擎 | A) Pebble / B) Velocity / C) Mustache / D) Handlebars | **A** |
 | 4 | 调用日志存储 | A) MySQL 单表 + 7 天 TTL（写入抽象 `MockCallLogRepository`，量级到顶再切）/ B) 直接上 ClickHouse / C) 直接上 Kafka | **A** |

@@ -32,6 +32,7 @@ ENVS = {
             "tp_task": ("tp_task", "t6kSKrhQMMsNQjit"),
             "tp_code_review": ("tp_code_review", "HSn3jQs5mHi6EsXn"),
             "tp_ui_test_base": ("tp_ui_test_base", "tx7b5e7FETxMAeB3"),
+            "tp_mock": ("tp_mock", "feDJfmA8tbQwnA7m"),
         },
         "default_creds": None,
     },

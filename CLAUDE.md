@@ -90,6 +90,7 @@ test-mng/
   | task-center | `tp_task` | `t6kSKrhQMMsNQjit` |
   | code-review | `tp_code_review` | `HSn3jQs5mHi6EsXn` |
   | ui-auto | `tp_ui_test_base` | `tx7b5e7FETxMAeB3` |
+  | mock | `tp_mock` | `feDJfmA8tbQwnA7m` |
 
 - 其它模块的库 / 密码以 Nacos 配置为准（在 Nacos 控制台搜对应 `*.yml` 中的 `spring.datasource.*`）。
 - **直接查 dev / fat MariaDB**：用 `.claude/skills/query-db.md` + `.claude/scripts/db_query.py`（默认只读，DDL/DML 须 `--confirm`；`--env dev|fat` 切换环境）。
