@@ -38,12 +38,9 @@ mvn clean package -DskipTests
 cd "$ROOT_DIR"
 
 SERVICES=(
-  "license-issuer:test-mng-license-issuer/target/test-mng-license-issuer.jar"
   "auth:test-mng-auth/target/test-mng-auth.jar"
   "system:test-mng-system/target/test-mng-system.jar"
-  "task-center:test-mng-task-center/target/test-mng-task-center.jar"
   "functional:test-mng-functional/target/test-mng-functional.jar"
-  "storage:test-mng-storage/target/test-mng-storage.jar"
   "api-test:test-mng-api-test/target/test-mng-api-test.jar"
   "api-test-execution:test-mng-api-test-execution/target/test-mng-api-test-execution.jar"
   "gateway:test-mng-gateway/target/test-mng-gateway.jar"
