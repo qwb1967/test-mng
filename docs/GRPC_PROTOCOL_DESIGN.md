@@ -300,17 +300,150 @@ private ManagedChannel getOrCreateChannel(String host, int port, boolean useTLS)
 
 ### 7.1 上传格式决策
 
-**已决定：方案 B —— 上传 `.proto` 源码，服务端运行时编译**。
+**已决定：上传 `.proto` 源码，服务端运行时编译**。
 
 原因：测试人员通常拿到的就是 `.proto` 源文件，不必额外学习 `protoc --descriptor_set_out` 命令，体验更顺。
 
-实施要点：
+### 7.2 运行时编译方案对比
 
-- 引入 `com.github.os72:protoc-jar:3.11.4`（嵌入式 protoc，运行时调用编译 `.proto` → `FileDescriptorSet`）
-- 或备选：用纯 Java protobuf 解析器（`com.squareup.wire:wire-schema` 等）
-- 编译失败时返回明确的 syntax error 行号
-- `tb_protocol_file.file_content` 已是 LONGTEXT（适合源码字符串），无需 schema 变更
-- 多文件 import 场景：先支持单文件 / 用户 paste 进去，多文件 import 留扩展点
+| 方案 | 决策 | 原因 |
+|---|---|---|
+| `com.github.os72:protoc-jar:3.11.4` | ❌ | 已死库，2020 年后无更新，无 M1/M2 原生支持 |
+| `com.squareup.wire:wire-schema` | ❌ | 纯 Java 但**不输出 FileDescriptorSet**，需自写 AST→FileDescriptorProto 转换器 |
+| 容器内置 protoc | ❌ | 服务器需预装，运维协调成本高，本地 macOS 也得手动装 |
+| **`com.google.protobuf:protoc` 官方 binary** | ✅ | Google 官方维护，跟随 protoc 同步发版，按 OS classifier 分发 |
+
+**最终方案**：用 Maven dependency 拉取 `com.google.protobuf:protoc:3.25.3` 的 binary artifact（按 classifier），构建时复制到 `target/classes/protoc/`，运行时从 classpath 释放到 `java.io.tmpdir`、`setExecutable(true)` 后用 ProcessBuilder 调用。
+
+### 7.3 平台覆盖
+
+第一版打两个 classifier 的 protoc 进 fat jar：
+
+- **`linux-x86_64`** — 生产容器部署环境
+- **`osx-aarch_64`** — M1/M2 Mac 本地开发
+
+其它平台（`osx-x86_64` / `linux-aarch_64` 等）暂不打入，后续按需扩展。运行时按 `os.name` + `os.arch` 自动选取对应 binary。
+
+### 7.4 多文件 import 范围
+
+**第一版只支持单文件**：用户上传的 `.proto` 不能 `import` 其它非 well-known `.proto`。需要 import 的，先把 message 定义 inline 到一个文件里。
+
+`google/protobuf/*.proto` 等 well-known types 由 protoc 自带，正常可用。
+
+多文件 import（同 directory 下多个 `.proto`）作为后续扩展点。
+
+### 7.5 类设计
+
+新增 2 个类，落在 `cloud.aisky.protocol.grpc` 包（与 Stage 1 同包）：
+
+```
+cloud.aisky.protocol.grpc/
+├── ReflectionDescriptorResolver.java   ← Stage 1
+├── DynamicGrpcCaller.java              ← Stage 1
+├── ProtocRunner.java                   ← Stage 2 新增
+└── ProtoFileDescriptorResolver.java    ← Stage 2 新增
+```
+
+**`ProtocRunner`**（Spring bean，单例）：
+
+```java
+@Component
+public class ProtocRunner {
+    private final AtomicReference<Path> cachedProtoc = new AtomicReference<>();
+
+    // 启动时（或首次调用时）从 classpath:protoc/protoc-<classifier>.exe
+    // 释放到 java.io.tmpdir，setExecutable，缓存路径
+    private Path ensureProtocBinary() throws IOException;
+
+    // 接收 .proto 源码字符串，编译为 FileDescriptorSet 字节数组
+    public byte[] compileToDescriptorSet(String protoSource) throws Exception;
+}
+```
+
+**`ProtoFileDescriptorResolver`**（Spring bean）：
+
+```java
+@Component
+@RequiredArgsConstructor
+public class ProtoFileDescriptorResolver {
+    private final ProtocolFileService protocolFileService;
+    private final ProtocRunner protocRunner;
+
+    public Descriptors.MethodDescriptor resolve(
+            Long protoFileId, String serviceName, String methodName,
+            ConsoleCollector console) throws Exception {
+        // 1. ProtocolFileService.getById(protoFileId).getFileContent()
+        // 2. protocRunner.compileToDescriptorSet(source)
+        // 3. FileDescriptorSet.parseFrom(bytes)
+        // 4. 拓扑顺序建 Descriptors.FileDescriptor（含 well-known 依赖）
+        // 5. findServiceByName(simpleName) + fullName 校验 → findMethodByName
+    }
+}
+```
+
+### 7.6 主类改造
+
+`GrpcProtocolExecutor.execute()` 的 `PROTO_FILE` 分支接到 `protoFileResolver.resolve(...)`，调用链路复用 Stage 1 的 `dynamicCaller.invokeUnary(...)`。删掉 Stage 1 里 "Proto 文件模式将在 Stage 2 实现" 的兜底返回。
+
+读 `protoFileId` 来自 `protocolConfig.protoFileId`（已存在字段）。`protoFileId=0` 或为 null 时报错引导用户去上传 / 选择 proto 文件。
+
+### 7.7 Pom 改动
+
+**parent pom（build/extensions）**：
+
+```xml
+<extensions>
+    <extension>
+        <groupId>kr.motd.maven</groupId>
+        <artifactId>os-maven-plugin</artifactId>
+        <version>1.7.1</version>
+    </extension>
+</extensions>
+```
+
+**api-test-execution pom**：
+
+```xml
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-dependency-plugin</artifactId>
+            <executions>
+                <execution>
+                    <id>copy-protoc-linux-x86_64</id>
+                    <phase>generate-resources</phase>
+                    <goals><goal>copy</goal></goals>
+                    <configuration>
+                        <artifactItems>
+                            <artifactItem>
+                                <groupId>com.google.protobuf</groupId>
+                                <artifactId>protoc</artifactId>
+                                <version>${protobuf.version}</version>
+                                <classifier>linux-x86_64</classifier>
+                                <type>exe</type>
+                                <outputDirectory>${project.build.directory}/classes/protoc</outputDirectory>
+                                <destFileName>protoc-linux-x86_64.exe</destFileName>
+                            </artifactItem>
+                            <artifactItem>
+                                <groupId>com.google.protobuf</groupId>
+                                <artifactId>protoc</artifactId>
+                                <version>${protobuf.version}</version>
+                                <classifier>osx-aarch_64</classifier>
+                                <type>exe</type>
+                                <outputDirectory>${project.build.directory}/classes/protoc</outputDirectory>
+                                <destFileName>protoc-osx-aarch_64.exe</destFileName>
+                            </artifactItem>
+                        </artifactItems>
+                    </configuration>
+                </execution>
+            </executions>
+        </plugin>
+    </plugins>
+</build>
+```
+
+打包后 protoc binary 落在 fat jar 的 `BOOT-INF/classes/protoc/`，运行时 `ClassPathResource("protoc/protoc-" + classifier + ".exe")` 读出来。
 
 ### 7.2 ProtoFileDescriptorResolver
 
