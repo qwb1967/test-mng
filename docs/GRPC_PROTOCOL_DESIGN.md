@@ -505,6 +505,28 @@ public Descriptors.MethodDescriptor resolve(
 - 前端 `protocolConfig` 字段填写规则不变（Stage 2 仅加 proto 文件选择 UI）
 - `ProtocolExecutor` 接口与 `ProtocolResponse` 结构不变
 
+## 11. 生产发布提示（已知限制清单）
+
+完整面向用户的版本见 [GRPC_USER_GUIDE.md §8](./GRPC_USER_GUIDE.md#8-当前版本限制)。开发同步要点：
+
+- **streaming 全部不支持**（server / client / bidi），调用 streaming 方法会失败
+- **proto 单文件 ≤ 1MB**，不能 import 用户自定义 .proto
+- **多实例独立缓存**：proto 编译结果按 `(protoFileId, update_time)` 缓存在 JVM 本地；多实例部署时每实例首次调用都会触发 protoc 编译（约 1-2s）
+- **多租户权限校验未严格实施**：`ProtocolFileService` 的 `getById / update / delete` 未校验跨 space 越权，依赖前端按 space 过滤防护。待 `SessionUtils` 暴露 `getCurrentSpaceId()` 后单独工单加严格校验
+- **生产容器必须是 glibc 系**（如 debian / centos / ubuntu base image）。嵌入的 protoc binary 是 glibc-linked，**alpine（musl）会执行失败**
+- **删除引用检查**：proto 文件被 GRPC 接口的 `protocol_config.protoFileId` 引用时拒绝删除（`BizCodeEnum.PROTOCOL_FILE_IN_USE`）
+- **proto 源码大小服务端硬限制**：1MB（`ProtocolFileCreateDTO.fileContent` 加了 `@Size(max=1_048_576)`）
+
+### 11.1 后续工单（不阻塞本次发布）
+
+| 工单方向 | 简述 | 优先级 |
+|---|---|---|
+| streaming 支持 | server / client / bidi 三种 streaming 在测试平台的语义模型 + 实现 | P1 |
+| 独立 Proto 文件管理 CRUD 页面 | 菜单 + 列表 + 批量编辑 + 历史版本 | P2 |
+| 多租户严格校验 | `SessionUtils.getCurrentSpaceId()` 扩展 + `ProtocolFileService` 启用校验 | P2 |
+| 多文件 import 支持 | 同 directory 下多个 .proto 联合编译 | P3 |
+| 跨实例编译结果缓存 | Redis 缓存 FileDescriptorSet，按 `(protoFileId, updateTime)` 共享 | P3 |
+
 ## 11. 实施进展
 
 > 最近更新：2026-05-24
