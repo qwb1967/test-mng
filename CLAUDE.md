@@ -3,6 +3,13 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 使用用中文和用户对话
 
+## ⚠️ 测试约定（必读）
+
+- **不要主动写单元测试 / 集成测试来验证修复**——验证由用户自己跑，Claude 改完代码即可停手。
+- 修 bug / 加功能时，**只改业务代码 + 编译通过（`mvn ... compile` 或 `pnpm type:check`）就算结束**，不要顺手写 `*Test.java` 或在前端写 `*.spec.ts`。
+- 用户**明确要求**写测试时再写（例如"加个 xxx 的单测"、"测试覆盖一下边界"）。
+- 已有测试**不要主动删**，但也不要为新代码补单测除非用户要求。
+
 ## 仓库结构
 
 这是一个测试管理平台 (test-mng) 的 monorepo，由两个独立子项目 + 启动脚本组成。后端和前端有各自独立的 git 仓库，在根目录下聚合。
