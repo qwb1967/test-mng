@@ -3,6 +3,8 @@
 > 把现有散落在 `test-mng-api-test` 模块里的 Mock 能力，重构为一个**独立的微服务 + 网关层接入**的、覆盖全平台的通用 Mock 能力。
 >
 > 关键诉求：客户端 **URL 不变**、用 **Header 标记**触发 Mock；规则配置独立管理；性能、扩展性、可观测性全面升级。
+>
+> **📍 进度（2026-05-28）**：**P0（MVP）编码完成**并提交于分支 `feature/ASAIO-1384`（后端 13 + 前端 4 提交）；Prometheus 指标顺延 P1、Nacos 路由属部署期；P1 / P2 未开工。详见 §15 进度快照。
 
 ---
 
@@ -25,6 +27,7 @@
 | **D9** | **case 与 mock 的关系** | A) case 有独立期望（`tb_mock_expectation.case_id`）<br>B) **case 不存独立期望，引用接口期望** | **B** ✅（v1.2）：接口层定义所有期望，case 执行时按 case 的请求参数 CEL 命中接口下的某条期望；`tb_api_case` 加 `enable_mock` 字段（执行引擎用） |
 | **D10** | **未命中处理：穿透还是 503** | A) **穿透到真实业务**（mock-service 内部代理，对客户端透明）<br>B) 返回 404/503，客户端重试 | **A** ✅（v1.2）：客户端体感是"mock 没配就走真实接口"，无需感知；穿透目标 URL 由 mock-service 调 api-test InnerClient 解析环境配置（详见 §4.5）；**`PROXY` 响应类型从 P2 提前到 P0**（穿透就是 PROXY 的实质实现） |
 | **D11** | **环境信息怎么传** | 新增 `X-Env-Id` Header；前端 axios 从 currentEnvironment store 读，case 执行引擎从 case 配置读 | ✅（v1.2）：mock-service 穿透时用 envId 调 api-test InnerClient 解析 base_url |
+| **D12** | **链路 B（调试/用例，经执行引擎）mock 如何接入** | A) 复用链路 A 的网关 path 路由 + 注入 `X-Mock-*` 三头<br>B) 执行引擎按 apiId Feign 直连 mock-service 求值（hit/miss），与链路 A 分离 | **B** ✅（v1.6）：执行引擎直发被测系统、绕不到 test-mng-gateway，注入 Header 那套对链路 B 无效（现网 `resolveMockHeaders` 实为死代码）；改 apiId 求值后 env 不再是 mock 前置、穿透交还执行引擎现成逻辑。配套：mock-first 后穿透（PM 确认）、两套开关（接口级 vs per-exec）+ space 总开关为顶层门。**详见 §4.6** |
 
 ---
 
@@ -174,10 +177,10 @@ HTTP /mock/{spaceId}/...  ──▶  test-mng-gateway
 #### 流程 B：**case 执行时走 mock**
 ```
 1. 接口下面定义好 mock 期望（如"A 用户登录成功"，CEL 条件 username='A'）
-2. 在 case 编辑页打开「Mock」开关
-3. 跑 case：执行引擎给请求加 X-Mock-Enabled / X-Space-Id / X-Env-Id Header
-4. mock-service 按 case 的请求参数 CEL 命中接口下的期望
-5. 期望未匹配 → 穿透到真实接口（与流程 A 一致）
+2. 在 case 编辑页打开「Mock」开关（per-case enable_mock）
+3. 跑 case：执行引擎按 apiId Feign 调 mock-service 求值（v1.6 D12——不再注入 Header / 不经网关，详见 §4.6）
+4. mock-service 按 case 的请求参数 CEL 命中接口下的期望 → 命中返回 mock 响应
+5. 期望未匹配 → 执行引擎走它现成的真实调用（穿透；env 页面默认已选，体感与流程 A 一致）
 ```
 
 #### 流程 C：**多场景切换**（P1）
@@ -439,6 +442,47 @@ X-Env-Id:   <currentEnvId>    ← 穿透时解析真实 URL
 | envId 有效但 path 在该环境无匹配 service config | 404 + `X-Mock-Hit: passthrough_no_route` + `X-Mock-Passthrough-Reason: env_no_route` |
 | api-test InnerClient 调用失败 | 502 + `X-Mock-Hit: passthrough_failed` + `X-Mock-Passthrough-Reason: env_resolve_error` |
 | 真实后端连接失败 / 5xx / 超时 | 502 + `X-Mock-Hit: passthrough_failed` + `X-Mock-Passthrough-Reason: upstream_error` |
+
+---
+
+### 4.6 链路 A vs 链路 B：两条 mock 接入路径（v1.6 D12）
+
+> 本节是 D12 的正文，**细化并修正** §3.1 流程 B、§4.4 case 侧开关、§4.5 穿透在"经执行引擎"场景下的描述。§5–§6 的网关 path 路由 + mock-service 内部穿透**只适用于链路 A**。
+
+**为什么要分两条**：执行引擎跑接口调试 / case 时，真实请求由它在服务端直发**被测系统**的 `base_url`（`buildFullUrl(ctx.baseUrl, apiUrl)` → `restTemplate.exchange`，见 `ApiCaseExecutionServiceImpl`），**不经过 test-mng-gateway**，所以 `MockRoutingFilter` 拦不到——靠注入 `X-Mock-*` Header 让网关改写路由的方案对这条链路根本无效（现网 `resolveMockHeaders` 实为死代码）。因此按"谁发起请求、是否经网关"分成两条：
+
+| | 链路 A：原始客户端 / 前端直连 | 链路 B：调试页 / case（经执行引擎）|
+|---|---|---|
+| 发起方 | 浏览器 / SDK / Postman 直打**真实接口 URL** | 执行引擎 `ApiCaseExecutionService` |
+| 是否经网关 | ✅ 经 test-mng-gateway，`MockRoutingFilter` 改写到 `/__mock` | ❌ 直发被测系统，绕不到网关 |
+| mock 怎么触发 | Header `X-Mock-Enabled` + path 路由 | 执行引擎按 **apiId** Feign 调 mock-service 求值 |
+| 匹配键 | `(space, method, path)` | `apiInfoId`（已知精确接口）|
+| space 来源 | 前端 `X-Space-Id`（无 apiId 可推）| 后端按 apiId 反查（`resolveCaseSpaceId`）或前端透传 |
+| 未命中 | mock-service 内部穿透（用 `X-Env-Id` 解析 base_url）| 执行引擎走它**现成的真实调用**（env 页面默认已选）|
+
+**链路 B 求值流程**（mock-first，PM 确认）：
+
+```
+执行引擎执行某接口（apiId 已知）
+  ├─ 本次执行 mock 开关 OFF（调试 useMock=false / case enable_mock!=1）→ 原样直发真实接口
+  └─ ON
+      ↓ 顶层门：tb_space.enable_mock 必须 ON（Q3）；OFF 视为不走 mock，直发真实接口
+      ↓ Feign 调 mock-service 求值（by apiInfoId）
+      ├─ 命中期望 → 直接拿 mock 响应当结果返回（不发被测系统），标记来源=mock + expectationId
+      └─ 未命中 → 执行引擎继续它本来的真实调用（即"穿透"），标记"未命中已穿透" + missReason
+```
+
+**两套开关（Q2）+ 三级门的关系**：`tb_space.enable_mock` 是 A/B **共享的顶层门**（Q3：链路 B 也必须先满足）；中层门**分叉**——链路 A 用接口级 `tb_mock_api.enabled`（对外/原始客户端），链路 B 用**每次执行**的开关（调试 `useMock` / case `enable_mock`），两者独立、互不影响（"接口对外可常开 mock，调试/用例每次可单独决定用不用"）；底层都是期望 CEL 匹配。
+
+> **【实现细节，待 PM 否决】**：链路 B 显式开 mock 时，中层门只看 per-exec 开关，**不再要求 `tb_mock_api.enabled`**（那是链路 A 的开关）——否则"调试/用例可单独决定用不用"不成立。
+
+**mock-service 求值接口契约（链路 B 专用，内部 Feign）**：
+
+- in：`{ apiInfoId, method, path, requestParams/body, headers? }`
+- out：`{ matched, statusCode, headers, body, expectationId?, missReason? }`
+- 复用 `MockMatchService` / `MockResponseBuilder`，入口从"按 path 找 mock_api"换成"按 apiInfoId 找 mock_api"，**本身不穿透**（穿透交还执行引擎）。
+
+**展示（Q4，尽量标注）**：调试结果面板标「✅ Mock 命中（期望 X）」/「↪ 未命中，已穿透真实接口（原因）」；用例报告同样标注命中 / 穿透。
 
 ---
 
@@ -1665,35 +1709,47 @@ src/api/modules/mock/
 
 ## 15. 实施计划（分阶段交付）
 
+> **📍 实现进度快照（截至 2026-05-28，分支 `feature/ASAIO-1384`）**
+>
+> **P0（MVP）已编码完成并提交**。后端 13 个提交：
+> `ef4d9aa6` P0 前置基建（6 表 DDL + 两表 `enable_mock`）→ `66e867ad` 模块骨架（6 表 Entity/Mapper）→ `89329314` 管理面 CRUD（11 接口）→ `0d3cf711` 引擎（CEL + Pebble）→ `729108bd` 数据面（缓存/路径索引/匹配/响应组合/运行时）→ `1f076d72` 现网适配（space 开关 / 环境解析 / 执行引擎注 Header）→ `c865656e` + `26097229` 穿透（请求体可重复读 + 代理转发）→ `8213c391` 网关路由分流（`MockRoutingFilter`）→ `fe51eb5b` 调用日志（异步有界队列 + 批量落盘）→ `3eb43147` 删旧版 mock（D6）→ `7de8d780` P0 验收单测 → `62bfc9b5` + `ade650f8` 收尾（gateway SaToken 放行 `/__mock/**`、ApiCase enableMock 全链路）。
+> 前端 4 个提交：`fd3e35e2` 基础设施（API/store/拦截器）→ `a260e612` 页面改造（Mock Tab / 期望抽屉 / case 字段 / 设置子页 + 删旧码）→ `75e385c1` + `bc02f59b` fix（X-Space-Id 用业务 space ID、空 JSON 送 `[]`/`{}`）。
+>
+> **两处 P0 清单项未落地（如实标注）**：
+> 1. **Prometheus 基础指标**：mock 模块暂无 metrics 代码，**顺延 P1**（与 `MOCK_DEPLOYMENT.md` §8.1「P0 仅基础观测、Metrics 在 P1」一致）。
+> 2. **Nacos 配置类项**（mock-service datasource / gateway 两条路由 / Knife4j 聚合）：属**部署期动作**（详见 `MOCK_DEPLOYMENT.md` §3.4–3.5），代码侧依赖（Filter + 前缀守卫、discover 自动聚合）均已就绪、等待环境部署。
+>
+> **P1 / P2 全部未开工**：`tb_mock_scenario` / `tb_mock_response` / `tb_mock_chaos_rule` 三表已建好但为空表，对应 Service/Controller 尚未实现。
+
 **P0 前置（编码前必须完成）**
 - [x] ✅ §0 D1-D11 决策已全部确认
-- [ ] **申请独立库 `tp_mock`** + 账号 / 密码（库名 = 用户名 = `tp_mock`）；在 `.claude/scripts/db_query.py` 的 `DB_CREDS` 中登记 `tp_mock`；dev Nacos 新增 datasource 配置
-- [ ] **DDL dry-run**：在 dev MariaDB 13307 验证 `tb_mock_api` 的 `(space_id, method, path)` 唯一索引；现状路径都不长就走 `path VARCHAR(192)`，否则 `path_hash CHAR(32)`
-- [ ] `tb_space.enable_mock` 字段添加（**system 模块** migration，见 §10.4.1）
-- [ ] `tb_api_case.enable_mock` 字段添加（**api-test 模块** migration，见 §10.4.1）
-- [ ] **api-test 模块** 暴露 `EnvironmentResolveService` + `ApiTestInnerClient`（resolve-base-url 接口，§13.4.1）—— 复用现有 case 执行引擎里"按环境解析 URL"的逻辑
+- [x] **申请独立库 `tp_mock`** + 账号 / 密码（库名 = 用户名 = `tp_mock`）；`.claude/scripts/db_query.py` 已登记 `tp_mock`（密码见根 `CLAUDE.md`）。⚠️ dev Nacos 的 datasource 随 `mock-service-dev.properties` 在部署期配置（`MOCK_DEPLOYMENT.md` §3.4）
+- [x] **DDL 就绪**：`sql/mock/mysql/20260507_init.sql`（6 表），`tb_mock_api` 走 `(space_id, method, path)` 唯一索引 + `path VARCHAR(192)`。⚠️ 目标环境的 dry-run / 执行属部署期
+- [x] `tb_space.enable_mock` 字段添加（**system 模块** migration `V1.0.19__add_enable_mock_to_space.sql`）
+- [x] `tb_api_case.enable_mock` 字段添加（**api-test 模块** migration `V20260521__add_enable_mock_to_api_case.sql`）
+- [x] **api-test 模块** 暴露 `EnvironmentResolveService` + `EnvironmentInnerController`（resolve-base-url，§13.4.1），mock 侧 `ApiTestInnerClient` 已对接
 
 **P0（MVP）** — 第一版可用
-- [ ] 新建 `test-mng-mock` Maven 模块（连独立库 `tp_mock`，需先完成上方 P0 前置的建库；datasource / Redis 配置参考 §17.5 Nacos 配置清单）
-- [ ] **6 张表全建**（即使 P0 只用 3 张），避免 P1/P2 反复迁移；P0 不开放的功能在管理 API 层屏蔽
-- [ ] Entity + Mapper + 基础 CRUD（管理面），Controller 用 `JsonDataVO<T>` / `PageDataVO<T>`，业务异常抛 `BizException` + `BizCodeEnum`
-- [ ] `MockRoutingFilter`（Header 触发；**含 `/mock-service/` 与 `/__mock/` 前缀守卫**，避免循环改写）
-- [ ] **网关 Nacos 路由配置**：`gateway-service-{profile}.properties` 加两条路由（§17.5.2）
-- [ ] **Knife4j 聚合配置**：把 mock-service 加入 doc.html 聚合
-- [ ] 数据面 Controller + 路径索引（`PathPattern`）+ Caffeine 缓存
-- [ ] CEL 表达式接入 + 表单 ↔ CEL 互转（含 §9.2 互转边界）
-- [ ] STATIC + TEMPLATE（Pebble）两种响应类型
-- [ ] **`MockProxyService` 穿透实现**（v1.2 D10 提前到 P0）：调 `ApiTestInnerClient.resolveBaseUrl` + WebClient 转发 + strip X-Mock-* Header
-- [ ] **`SystemInnerClient.isSpaceMockEnabled`**（D8 第 1 层开关查询，含 Caffeine 缓存）
-- [ ] 单一场景模式（每个 mock_api 一个 default 场景，前端不暴露场景切换）
-- [ ] **前端**：接口详情页加 Mock Tab + 右上角 Mock 开关（v1.2 截图样式）
-- [ ] **前端**：case 编辑页加 enable_mock 开关字段
-- [ ] **前端**：space 设置页加 Mock 子 Tab（总开关）
-- [ ] **前端 axios interceptor**：从 store 读 currentSpaceId / currentEnvId / shouldMock，注入 `X-Space-Id` / `X-Env-Id` / `X-Mock-Enabled`
-- [ ] **api-test 执行引擎**：执行 case 前读 `case.enable_mock`，true 时给请求加 `X-Mock-Enabled` / `X-Space-Id` / `X-Env-Id` Header
-- [ ] **调用日志 P0 落盘**（v1.2：穿透日志要看，从 P1 提前）：含 passthrough 字段、upstream_url 等
-- [ ] Prometheus 基础指标（含 `mock_passthrough_total`、`mock_upstream_duration_seconds_bucket`）
-- [ ] 旧版 Mock 代码下线：删除 `test-mng-api-test/.../controller/ApiMockController.java` 等旧文件 + 前端旧 `api-mock.ts`（D6 已确认不兼容）
+- [x] 新建 `test-mng-mock` Maven 模块（连独立库 `tp_mock`，需先完成上方 P0 前置的建库；datasource / Redis 配置参考 §17.5 Nacos 配置清单）
+- [x] **6 张表全建**（即使 P0 只用 3 张），避免 P1/P2 反复迁移；P0 不开放的功能在管理 API 层屏蔽
+- [x] Entity + Mapper + 基础 CRUD（管理面），Controller 用 `JsonDataVO<T>` / `PageDataVO<T>`，业务异常抛 `BizException` + `BizCodeEnum`
+- [x] `MockRoutingFilter`（Header 触发；**含 `/mock-service/` 与 `/__mock/` 前缀守卫**，避免循环改写）
+- [ ] **网关 Nacos 路由配置**：`gateway-service-{profile}.properties` 加两条路由（§17.5.2）—— ⚠️ 部署期，代码侧 Filter 已就绪
+- [ ] **Knife4j 聚合配置**：把 mock-service 加入 doc.html 聚合 —— ⚠️ 部署期，gateway discover 模式注册后自动聚合
+- [x] 数据面 Controller + 路径索引（`PathPattern`）+ Caffeine 缓存
+- [x] CEL 表达式接入 + 表单 ↔ CEL 互转（含 §9.2 互转边界）
+- [x] STATIC + TEMPLATE（Pebble）两种响应类型
+- [x] **`MockProxyService` 穿透实现**（v1.2 D10 提前到 P0）：调 `ApiTestInnerClient.resolveBaseUrl` + WebClient 转发 + strip X-Mock-* Header
+- [x] **`SystemInnerClient.isSpaceMockEnabled`**（D8 第 1 层开关查询，含 Caffeine 缓存）
+- [x] 单一场景模式（每个 mock_api 一个 default 场景，前端不暴露场景切换）
+- [x] **前端**：接口详情页加 Mock Tab + 右上角 Mock 开关（v1.2 截图样式）
+- [x] **前端**：case 编辑页加 enable_mock 开关字段
+- [x] **前端**：space 设置页加 Mock 子 Tab（总开关）—— 实现落在「应用设置 - Mock 子页」
+- [x] **前端 axios interceptor**：从 store 读 currentSpaceId / currentEnvId / shouldMock，注入 `X-Space-Id` / `X-Env-Id` / `X-Mock-Enabled`
+- [x] **api-test 执行引擎**：执行 case 前读 `case.enable_mock`，true 时给请求加 `X-Mock-Enabled` / `X-Space-Id` / `X-Env-Id` Header
+- [x] **调用日志 P0 落盘**（v1.2：穿透日志要看，从 P1 提前）：含 passthrough 字段、upstream_url 等
+- [ ] Prometheus 基础指标（含 `mock_passthrough_total`、`mock_upstream_duration_seconds_bucket`）—— ⚠️ 未实现，顺延 P1
+- [x] 旧版 Mock 代码下线：删除 `test-mng-api-test/.../controller/ApiMockController.java` 等旧文件 + 前端旧 `api-mock.ts`（D6 已确认不兼容）
 
 **P1（第二阶段）** — 高级特性
 - [ ] 场景管理（创建、切换、批量切场景）
@@ -2303,11 +2359,11 @@ curl -i .../api/login -H "X-Mock-Enabled: true" -H "X-Space-Id: 1"
 
 ---
 
-**文档版本**：v1.4
-**最后更新**：2026-05-21
+**文档版本**：v1.6
+**最后更新**：2026-05-28
 **作者**：qianwenbo（牵头），团队待补
-**状态**：✅ 决策已对齐（D1-D11 + 架构 15 项）。v1.4 关键变更：代码评审修正 16 项——请求体可重复读包装（#1）、穿透异常补 `path` 并区分 mockApiId/apiInfoId（#2/#3）、`X-Mock-Expectation` 租户校验（#4）、逻辑删除字段移出唯一索引（#5）、调用日志入队前快照（#6）、§6.1 过时骨架标注（#7）、熔断兜底单一化（#8）、场景回落默认（#9）、`lookup` 取唯一接口（#10）、CEL 缺失字段语义（#11）、`miss_reason` 枚举统一（#12）、及 4 项文档过时小修（#13–16），逐条见正文"修正 #N"标注。v1.3 关键变更：① 库归属由"复用 `tp_interface`"反转为**独立库 `tp_mock`**（决策记录 #1 改判为 A，详见 §10.1）；② §10.2 六张表 DDL 全面对齐团队数据库红线（DATETIME 替代 TIMESTAMP、`modify_time` + `ix_modify_time` 索引、`BIGINT UNSIGNED` 主键、全字段 NOT NULL + 默认值、`TINYINT` 替代 ENUM、索引 `ix_` 前缀、ALTER 去 `AFTER`）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
-**P0 前置任务**：申请独立库 `tp_mock` + 凭据 / parent pom 加依赖 / DDL dry-run / 前端 axios 加 `X-Space-Id` 和 `X-Env-Id` / `tb_space.enable_mock` 与 `tb_api_case.enable_mock` 字段 / api-test 暴露 `EnvironmentResolveService` InnerClient / Nacos 配置见 §17.5
+**状态**：✅ **P0（MVP）编码完成**（2026-05-28，分支 `feature/ASAIO-1384`，后端 13 + 前端 4 提交；详见 §15 进度快照）；Prometheus 指标顺延 P1、Nacos 配置属部署期；P1 / P2 未开工。决策已对齐（D1-D12 + 架构 15 项）。v1.6 关键变更：新增 **D12**——链路 B（调试 / 用例，经执行引擎）改为执行引擎按 apiId Feign 直连 mock-service 求值，与链路 A 分离；mock-first 后穿透（穿透交还执行引擎）；两套开关 + space 总开关为顶层门（详见 §4.6，同步修正 §3.1 流程 B）。v1.4 关键变更：代码评审修正 16 项——请求体可重复读包装（#1）、穿透异常补 `path` 并区分 mockApiId/apiInfoId（#2/#3）、`X-Mock-Expectation` 租户校验（#4）、逻辑删除字段移出唯一索引（#5）、调用日志入队前快照（#6）、§6.1 过时骨架标注（#7）、熔断兜底单一化（#8）、场景回落默认（#9）、`lookup` 取唯一接口（#10）、CEL 缺失字段语义（#11）、`miss_reason` 枚举统一（#12）、及 4 项文档过时小修（#13–16），逐条见正文"修正 #N"标注。v1.3 关键变更：① 库归属由"复用 `tp_interface`"反转为**独立库 `tp_mock`**（决策记录 #1 改判为 A，详见 §10.1）；② §10.2 六张表 DDL 全面对齐团队数据库红线（DATETIME 替代 TIMESTAMP、`modify_time` + `ix_modify_time` 索引、`BIGINT UNSIGNED` 主键、全字段 NOT NULL + 默认值、`TINYINT` 替代 ENUM、索引 `ix_` 前缀、ALTER 去 `AFTER`）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
+**P0 前置任务**（✅ 已全部完成，见 §15 进度快照）：申请独立库 `tp_mock` + 凭据 / parent pom 加依赖 / DDL dry-run / 前端 axios 加 `X-Space-Id` 和 `X-Env-Id` / `tb_space.enable_mock` 与 `tb_api_case.enable_mock` 字段 / api-test 暴露 `EnvironmentResolveService` InnerClient / Nacos 配置见 §17.5
 
 ---
 

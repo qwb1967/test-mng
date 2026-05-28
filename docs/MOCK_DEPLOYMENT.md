@@ -3,7 +3,8 @@
 > 配套设计文档：[`docs/MOCK_REDESIGN.md`](./MOCK_REDESIGN.md) v1.4
 > 适用版本：mock-service v1.0（test-mng-mock 模块首次发布）
 > 涉及环境：dev / fat / prod
-> 状态：✅ 编码完成（后端阶段 1–9 + 前端阶段 10–11），等待环境部署
+> 状态：✅ 编码完成（后端阶段 1–9 + 前端阶段 10–11，分支 `feature/ASAIO-1384`，后端 13 + 前端 4 提交），等待环境部署
+> ⚠️ 两点说明：Prometheus 指标顺延 P1（见 §8.1）；本手册 §3.4 / §3.5 的 Nacos 配置属部署期动作，代码侧已就绪
 
 ---
 
