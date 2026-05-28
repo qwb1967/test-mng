@@ -910,6 +910,51 @@ X-Mock-Chaos: latency=500-2000;error_rate=0.1;drop_field=token
 
 ---
 
+### 8.5 挡板增强：透传兜底 / 后置规则 / 不匹配策略（P1/P2，对齐产品挡板描述）
+
+> 产品对 Mock 的完整诉求是一个类 Fiddler / Charles 的「挡板」：**前置匹配 → 命中返回 / 未命中穿透 → 穿透失败兜底 → 穿透成功后置改写**。
+> P0 已交付前半段（前置匹配 + 命中返回 + 未命中穿透，见 §6.2 / §4.5 / §4.6）；本节登记后半段增强，留待 P1/P2 实现。**第一版（P0）不含本节内容。**
+
+**完整挡板流程**（★ = P0 已做，☆ = 待补）：
+
+```
+请求进入
+  ★ a. 启用 mock → 流量先到 mock（链路 A 网关分流 / 链路 B 执行引擎先求值）
+  ★ b. 前置规则（请求 CEL）命中 → 直接返回 mock 响应
+  ★ c. 未命中 → 透传真实地址
+  ☆ d. 透传失败（下游不可达 / 5xx）→ 回放「最近一次成功响应」
+        · 数据来源：tb_mock_call_log（已存全量请求 + 响应，见 §10.2 表 6）
+        · 按 (space, method, path[, 请求特征]) 查最近一条 matched 或 2xx 记录
+        · 响应加特殊头：X-Mock-Hit: last-record + X-Mock-Last-Record-Time（便于前端提示「这是上次记录的兜底返回」）
+        · 接口级 / 期望级开关：穿透失败时「直接返错」 or「返回最近一次成功记录」
+  ☆ e. 透传成功 → 后置规则改写真实响应后返回
+        · 新增「后置规则」概念，区别于现有「前置匹配 + 生成响应」
+        · 规则形如：CEL/JS 条件 + 对 response body / header / status 的改写动作（类 Charles Rewrite / Map）
+  ☆ f. 不匹配处理策略可配置
+        · 前置未命中：穿透（当前写死） / 返 404 / 返指定响应
+        · 后置未命中：原样返回（默认） / 按兜底规则改写
+  ☆ g. 规则脚本：当前匹配用 CEL（D2 选型，已覆盖 header / body 校验）；
+        JS 脚本响应（GraalJS，SCRIPT 类型）见 §7.3，属 P1
+```
+
+**数据模型增量（P1/P2 落地时定稿）**：
+
+- `tb_mock_api` 加穿透失败兜底策略：`fallback_mode TINYINT`（0-直接返错 / 1-返回最近一次成功记录），对应 d。
+- 「后置规则」：复用 `tb_mock_expectation` 加 `phase TINYINT`（0-前置 / 1-后置）+ 响应改写动作字段，或新建 `tb_mock_post_rule`（待定），对应 e。
+- 前置 / 后置不匹配处置策略字段（接口级 or 期望级），对应 f。
+- d 的回放查询：`tb_mock_call_log` 字段已具备，补「按请求特征查最近成功记录」的查询即可。
+
+**⚠️ 链路 B 落点（动工前必须先定）**：d / e / f 的穿透发生在 mock-service（链路 A）时天然成立；但链路 B（调试 / 用例，§4.6 D12）的穿透是**执行引擎自己发真实请求、不经 mock-service**。两种处置：
+
+1. 链路 B 的穿透也改走 mock-service（部分回退 D12），统一挡板逻辑于一处；
+2. 在执行引擎侧也实现 d / e / f。
+
+**可观测前置**：链路 B 当前**不写 `tb_mock_call_log`**（§4.6 求值不落日志）。d 的「最近一次记录」回放依赖日志，故链路 B 若要支持 d，需先补求值 / 穿透落日志。
+
+**点 6（host 映射 → UI 页面挡板）**：产品标注为「后续」，归入 §15 P3。
+
+---
+
 ## 9. DSL 与匹配引擎
 
 ### 9.1 路径索引（Radix Tree）
@@ -1757,6 +1802,9 @@ src/api/modules/mock/
 - [ ] 多响应（加权随机）
 - [ ] Redis pub/sub 热更新
 - [ ] 前端调用日志页面增强（接口维度详情抽屉 + space 维度全局视图 + CEL 求值树）
+- [ ] **挡板增强 · 透传失败兜底**（穿透失败 → 回放最近一次成功记录 + `X-Mock-Hit: last-record` 头 + 接口级「返错/返上次」开关，§8.5d）
+- [ ] **挡板增强 · 前置未命中处置策略可配置**（穿透 / 404 / 指定响应；当前写死=穿透，§8.5f）
+- [ ] 链路 B（调试/用例）求值/穿透补写 `tb_mock_call_log`（§4.6 当前不落日志，是 §8.5d 回放的前置）
 
 **P2（第三阶段）** — 增强能力
 - [ ] 录制回放
@@ -1764,12 +1812,15 @@ src/api/modules/mock/
 - [ ] Chaos 故障注入
 - [ ] OpenAPI 一键导入
 - [ ] gRPC（如有需求）
+- [ ] **挡板增强 · 后置规则**（改写穿透回来的真实响应：CEL/JS 条件 + body/header/status 改写动作，§8.5e）
+- [ ] **挡板增强 · 链路 B 穿透落点决策**（链路 B 穿透改走 mock-service 统一逻辑 vs 执行引擎侧实现 d/e/f，§8.5）
 
 **P3（持续优化）**
 - [ ] 版本管理 / Git 同步
 - [ ] WebSocket / MQTT
 - [ ] A/B 灰度 Mock
 - [ ] AI 生成期望
+- [ ] **host 映射 → 支撑 UI 脚本页面挡板**（产品点 6，§8.5）
 
 ---
 
@@ -2359,10 +2410,10 @@ curl -i .../api/login -H "X-Mock-Enabled: true" -H "X-Space-Id: 1"
 
 ---
 
-**文档版本**：v1.6
+**文档版本**：v1.7
 **最后更新**：2026-05-28
 **作者**：qianwenbo（牵头），团队待补
-**状态**：✅ **P0（MVP）编码完成**（2026-05-28，分支 `feature/ASAIO-1384`，后端 13 + 前端 4 提交；详见 §15 进度快照）；Prometheus 指标顺延 P1、Nacos 配置属部署期；P1 / P2 未开工。决策已对齐（D1-D12 + 架构 15 项）。v1.6 关键变更：新增 **D12**——链路 B（调试 / 用例，经执行引擎）改为执行引擎按 apiId Feign 直连 mock-service 求值，与链路 A 分离；mock-first 后穿透（穿透交还执行引擎）；两套开关 + space 总开关为顶层门（详见 §4.6，同步修正 §3.1 流程 B）。v1.4 关键变更：代码评审修正 16 项——请求体可重复读包装（#1）、穿透异常补 `path` 并区分 mockApiId/apiInfoId（#2/#3）、`X-Mock-Expectation` 租户校验（#4）、逻辑删除字段移出唯一索引（#5）、调用日志入队前快照（#6）、§6.1 过时骨架标注（#7）、熔断兜底单一化（#8）、场景回落默认（#9）、`lookup` 取唯一接口（#10）、CEL 缺失字段语义（#11）、`miss_reason` 枚举统一（#12）、及 4 项文档过时小修（#13–16），逐条见正文"修正 #N"标注。v1.3 关键变更：① 库归属由"复用 `tp_interface`"反转为**独立库 `tp_mock`**（决策记录 #1 改判为 A，详见 §10.1）；② §10.2 六张表 DDL 全面对齐团队数据库红线（DATETIME 替代 TIMESTAMP、`modify_time` + `ix_modify_time` 索引、`BIGINT UNSIGNED` 主键、全字段 NOT NULL + 默认值、`TINYINT` 替代 ENUM、索引 `ix_` 前缀、ALTER 去 `AFTER`）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
+**状态**：✅ **P0（MVP）编码完成**（2026-05-28，分支 `feature/ASAIO-1384`，后端 13 + 前端 4 提交；详见 §15 进度快照）；Prometheus 指标顺延 P1、Nacos 配置属部署期；P1 / P2 未开工。决策已对齐（D1-D12 + 架构 15 项）。v1.7：新增 §8.5 挡板增强（透传失败兜底 §8.5d / 后置规则改写 §8.5e / 不匹配处置策略 §8.5f / host 映射），并登记至 §15 P1–P3——对齐产品「类 Fiddler 挡板」完整描述；第一版（P0）不含这些增强。v1.6 关键变更：新增 **D12**——链路 B（调试 / 用例，经执行引擎）改为执行引擎按 apiId Feign 直连 mock-service 求值，与链路 A 分离；mock-first 后穿透（穿透交还执行引擎）；两套开关 + space 总开关为顶层门（详见 §4.6，同步修正 §3.1 流程 B）。v1.4 关键变更：代码评审修正 16 项——请求体可重复读包装（#1）、穿透异常补 `path` 并区分 mockApiId/apiInfoId（#2/#3）、`X-Mock-Expectation` 租户校验（#4）、逻辑删除字段移出唯一索引（#5）、调用日志入队前快照（#6）、§6.1 过时骨架标注（#7）、熔断兜底单一化（#8）、场景回落默认（#9）、`lookup` 取唯一接口（#10）、CEL 缺失字段语义（#11）、`miss_reason` 枚举统一（#12）、及 4 项文档过时小修（#13–16），逐条见正文"修正 #N"标注。v1.3 关键变更：① 库归属由"复用 `tp_interface`"反转为**独立库 `tp_mock`**（决策记录 #1 改判为 A，详见 §10.1）；② §10.2 六张表 DDL 全面对齐团队数据库红线（DATETIME 替代 TIMESTAMP、`modify_time` + `ix_modify_time` 索引、`BIGINT UNSIGNED` 主键、全字段 NOT NULL + 默认值、`TINYINT` 替代 ENUM、索引 `ix_` 前缀、ALTER 去 `AFTER`）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
 **P0 前置任务**（✅ 已全部完成，见 §15 进度快照）：申请独立库 `tp_mock` + 凭据 / parent pom 加依赖 / DDL dry-run / 前端 axios 加 `X-Space-Id` 和 `X-Env-Id` / `tb_space.enable_mock` 与 `tb_api_case.enable_mock` 字段 / api-test 暴露 `EnvironmentResolveService` InnerClient / Nacos 配置见 §17.5
 
 ---
