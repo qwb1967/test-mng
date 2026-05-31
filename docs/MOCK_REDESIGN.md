@@ -1312,6 +1312,17 @@ mock-service 启动时一次性查 `tb_mock_api` + `tb_mock_expectation`（按 `
 
 ### 11.3 热更新
 
+> **🟢 当前实现（P0 + P0.5，v1.8）**：
+> 1. **启动**：`ApplicationRunner` 一次性全量加载（§11.2）。
+> 2. **60s 对账**（P0）：`MockRuleCache.reconcile()` 比对 (行数, MAX(modify_time))，有差异全量重载。
+> 3. **CRUD 主动刷新**（P0.5）：admin 改 `tb_mock_api` / `tb_mock_expectation` 的 7 个方法（`MockApiServiceImpl#{createOrEnable,toggle,delete}` + `MockExpectationServiceImpl#{create,update,delete,toggle}`）在 `@Transactional` 提交后调 `MockRuleCache.refreshNowAfterCommit()`——**本进程实例立即生效**；多实例下其它实例仍等下一轮对账（≤60s）。
+>    实现细节：注册 Spring `TransactionSynchronization.afterCommit` 钩子，回滚不污染缓存；失败只 warn，由对账兜底。
+> 4. **Redis pub/sub**（P1，未做）：跨实例 ≤3s 同步，见 §15 P1。
+>
+> ---
+>
+> **P1 目标全貌**（pub/sub + 对账兜底）：
+
 **配置面 CRUD 完成后**：
 1. 写 MySQL
 2. 写 Redis（删 cache key）
@@ -2410,10 +2421,10 @@ curl -i .../api/login -H "X-Mock-Enabled: true" -H "X-Space-Id: 1"
 
 ---
 
-**文档版本**：v1.7
+**文档版本**：v1.8
 **最后更新**：2026-05-28
 **作者**：qianwenbo（牵头），团队待补
-**状态**：✅ **P0（MVP）编码完成**（2026-05-28，分支 `feature/ASAIO-1384`，后端 13 + 前端 4 提交；详见 §15 进度快照）；Prometheus 指标顺延 P1、Nacos 配置属部署期；P1 / P2 未开工。决策已对齐（D1-D12 + 架构 15 项）。v1.7：新增 §8.5 挡板增强（透传失败兜底 §8.5d / 后置规则改写 §8.5e / 不匹配处置策略 §8.5f / host 映射），并登记至 §15 P1–P3——对齐产品「类 Fiddler 挡板」完整描述；第一版（P0）不含这些增强。v1.6 关键变更：新增 **D12**——链路 B（调试 / 用例，经执行引擎）改为执行引擎按 apiId Feign 直连 mock-service 求值，与链路 A 分离；mock-first 后穿透（穿透交还执行引擎）；两套开关 + space 总开关为顶层门（详见 §4.6，同步修正 §3.1 流程 B）。v1.4 关键变更：代码评审修正 16 项——请求体可重复读包装（#1）、穿透异常补 `path` 并区分 mockApiId/apiInfoId（#2/#3）、`X-Mock-Expectation` 租户校验（#4）、逻辑删除字段移出唯一索引（#5）、调用日志入队前快照（#6）、§6.1 过时骨架标注（#7）、熔断兜底单一化（#8）、场景回落默认（#9）、`lookup` 取唯一接口（#10）、CEL 缺失字段语义（#11）、`miss_reason` 枚举统一（#12）、及 4 项文档过时小修（#13–16），逐条见正文"修正 #N"标注。v1.3 关键变更：① 库归属由"复用 `tp_interface`"反转为**独立库 `tp_mock`**（决策记录 #1 改判为 A，详见 §10.1）；② §10.2 六张表 DDL 全面对齐团队数据库红线（DATETIME 替代 TIMESTAMP、`modify_time` + `ix_modify_time` 索引、`BIGINT UNSIGNED` 主键、全字段 NOT NULL + 默认值、`TINYINT` 替代 ENUM、索引 `ix_` 前缀、ALTER 去 `AFTER`）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
+**状态**：✅ **P0（MVP）编码完成**（2026-05-28，分支 `feature/ASAIO-1384`，后端 13 + 前端 4 提交；详见 §15 进度快照）；Prometheus 指标顺延 P1、Nacos 配置属部署期；P1 / P2 未开工。决策已对齐（D1-D12 + 架构 15 项）。v1.8：CRUD 主动刷新缓存接通（§11.3 P0.5）——admin 7 个写方法在事务提交后调 `MockRuleCache.refreshNowAfterCommit()`，本进程实例立即生效，多实例同步留待 P1 pub/sub。v1.7：新增 §8.5 挡板增强（透传失败兜底 §8.5d / 后置规则改写 §8.5e / 不匹配处置策略 §8.5f / host 映射），并登记至 §15 P1–P3——对齐产品「类 Fiddler 挡板」完整描述；第一版（P0）不含这些增强。v1.6 关键变更：新增 **D12**——链路 B（调试 / 用例，经执行引擎）改为执行引擎按 apiId Feign 直连 mock-service 求值，与链路 A 分离；mock-first 后穿透（穿透交还执行引擎）；两套开关 + space 总开关为顶层门（详见 §4.6，同步修正 §3.1 流程 B）。v1.4 关键变更：代码评审修正 16 项——请求体可重复读包装（#1）、穿透异常补 `path` 并区分 mockApiId/apiInfoId（#2/#3）、`X-Mock-Expectation` 租户校验（#4）、逻辑删除字段移出唯一索引（#5）、调用日志入队前快照（#6）、§6.1 过时骨架标注（#7）、熔断兜底单一化（#8）、场景回落默认（#9）、`lookup` 取唯一接口（#10）、CEL 缺失字段语义（#11）、`miss_reason` 枚举统一（#12）、及 4 项文档过时小修（#13–16），逐条见正文"修正 #N"标注。v1.3 关键变更：① 库归属由"复用 `tp_interface`"反转为**独立库 `tp_mock`**（决策记录 #1 改判为 A，详见 §10.1）；② §10.2 六张表 DDL 全面对齐团队数据库红线（DATETIME 替代 TIMESTAMP、`modify_time` + `ix_modify_time` 索引、`BIGINT UNSIGNED` 主键、全字段 NOT NULL + 默认值、`TINYINT` 替代 ENUM、索引 `ix_` 前缀、ALTER 去 `AFTER`）。v1.2 关键变更：完全分散式（D7=B 删除 Mock 中心菜单）+ 三级开关（D8）+ case 引用接口期望（D9）+ 未命中自动穿透（D10）+ 新增 `X-Env-Id` Header（D11）+ `PROXY` 提前到 P0。
 **P0 前置任务**（✅ 已全部完成，见 §15 进度快照）：申请独立库 `tp_mock` + 凭据 / parent pom 加依赖 / DDL dry-run / 前端 axios 加 `X-Space-Id` 和 `X-Env-Id` / `tb_space.enable_mock` 与 `tb_api_case.enable_mock` 字段 / api-test 暴露 `EnvironmentResolveService` InnerClient / Nacos 配置见 §17.5
 
 ---
