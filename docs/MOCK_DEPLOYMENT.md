@@ -328,7 +328,9 @@ fat / prod 走各自的运维凭据管理体系，按团队约定办。
 
 ```
 全停 Mock 日志写：    Nacos 改 mock.audit.enabled=false（保留命中能力，停日志）
-某企业有问题：        tb_space.enable_mock=0（该企业全部 mock 失效，流量穿透）
+                     ⚠️ mock.audit.* / mock.proxy.* 用 @Value 注入、未加 @RefreshScope，
+                     改完 Nacos 须重启 mock-service 才生效（非热更新）；要立即止血优先用下面两层开关
+某企业有问题：        tb_space.enable_mock=0（该企业全部 mock 失效，流量穿透；注意 mock 侧有 60s 缓存，最长 60s 生效）
 某接口有问题：        前端关接口右上角 Mock 开关（或直改 tb_mock_api.enabled=0）
 mock-service 整挂：   gateway 自动 503 fallback，不影响其他业务；
                      如需完全下线，把 gateway 中 mock 两条路由临时移除即可
@@ -451,9 +453,13 @@ WHERE create_time >= NOW() - INTERVAL 1 DAY AND api_id > 0
 GROUP BY api_id ORDER BY total DESC;
 
 -- 24h 穿透失败原因 TOP
+-- 注意：穿透「失败」时 passthrough 记 0（X-Mock-Hit=passthrough_failed/passthrough_no_route）、status_code=502/404；
+--      passthrough=1 仅代表穿透「成功」（上游 2xx/3xx/4xx 原样回传）。故失败统计须按 miss_reason 过滤，
+--      不能用 `passthrough=1 AND status_code>=500`（那样查不到任何失败记录）。
 SELECT miss_reason, COUNT(*) AS cnt
 FROM tb_mock_call_log
-WHERE passthrough = 1 AND status_code >= 500
+WHERE passthrough = 0
+  AND miss_reason IN ('env_resolve_error', 'env_no_route', 'upstream_error')
   AND create_time >= NOW() - INTERVAL 1 DAY
 GROUP BY miss_reason ORDER BY cnt DESC;
 
@@ -477,6 +483,8 @@ P0 不含：
 - 表单 → CEL 单向（CEL 不反推回表单）
 - cURL 复制使用 `VITE_API_URL` 作 origin（不是被测系统真实域名）—— 复制后用户自己改 host
 - apiMockStore.refresh() 异步刷新（开 Mock 后立即发请求可能漏 X-Mock-Enabled，重试一次即可）
+- **前端 axios 暂不注入 `X-Env-Id`**（`src/api/index.ts` 中为 TODO，待引入「当前环境」状态后补）：链路 B（case / 调试经执行引擎）的 X-Env-Id 由执行引擎注入、不受影响；链路 A 若由浏览器直发业务路径触发 Mock，会因缺 X-Env-Id 被 mock-service 拒（`code:400 X-Env-Id Header 缺失`）。外部客户端（Postman/SDK）需自行带齐三头（见应用「设置 → Mock 服务」页的 Header 协议与示例 cURL）
+- **穿透暂不应用环境的 host 别名（`hostMappings`，`tb_environment_host.hosts_enabled=1` 的 域名→IP 改写）**：`MockProxyService` 直接按 `base_url` 的真实 DNS 转发；case 执行引擎则会按 host 别名改写。故对「仅靠 host 别名才可达」的环境，链路 A 穿透与 case 执行行为不一致（配了别名时 mock-service 会打 WARN 提示）。P1 修复方向：穿透客户端换 Apache HttpClient5 + 自定义 `DnsResolver`，或 JDK 侧 URI host→IP 改写 + 显式 `Host` 头
 - 接口右上角 Mock 开关 UI 位置在 ApiInfoView actions slot（切到 Mock Tab 时隐藏；后续可挪到 detail-header）
 
 完整 P1 / P2 / P3 清单见 [`docs/MOCK_REDESIGN.md`](./MOCK_REDESIGN.md) §15。
@@ -489,8 +497,8 @@ P0 不含：
 |---|---|
 | mock-service 启动失败 | 检查 Nacos `mock-service-{profile}.properties`；检查 `tp_mock` 库连接；gateway fallback 自动生效、业务流量不阻塞 |
 | 大量 `X-Mock-Hit: passthrough_failed` | 检查 ApiTestInnerClient 可达；检查 env 配置的 base_url；必要时设 `tb_space.enable_mock=0` 全停 |
-| `tb_mock_call_log` 写崩 / 库满 | Nacos 改 `mock.audit.enabled=false` 立即停日志写入；不影响 mock 命中；之后清理历史日志（按 retention-days 自动清理或手工 DELETE） |
-| 穿透下游真实接口超时 | Nacos 调 `mock.proxy.default-response-timeout-ms`（默认 30000）；或 env 配置 per-request 超时 |
+| `tb_mock_call_log` 写崩 / 库满 | Nacos 改 `mock.audit.enabled=false` 停日志写入（⚠️ 该项 @Value 注入、非 @RefreshScope，**改完须重启 mock-service 才生效**）；不影响 mock 命中；之后清理历史日志（按 retention-days 自动清理或手工 DELETE） |
+| 穿透下游真实接口超时 | Nacos 调 `mock.proxy.default-response-timeout-ms`（默认 30000，⚠️ 同样非热更新、**改完须重启 mock-service**）；或在 env 配置 per-request 超时（无需重启、即时生效） |
 | 全局 Mock 命中错乱 | `tb_space.enable_mock=0` → 该企业全部穿透；或 `tb_mock_api.enabled=0` → 接口级穿透 |
 | gateway 加载新路由失败 | Nacos 控制台改回旧版（删除追加的 2 条路由）；gateway 自动刷新（或手动重启） |
 | Flyway migration 卡住 | 检查 `flyway_schema_history` 表，找到失败记录手工 `UPDATE ... SET success=1`；或 DBA 手工跑 ALTER 后 mark migration 为 success |
